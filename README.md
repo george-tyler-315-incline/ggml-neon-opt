@@ -180,7 +180,7 @@ cmake -S external/llama.cpp -B external/llama.cpp/build \
 cmake --build external/llama.cpp/build --verbose
 ```
 
-### Initial GGML Profiling on the Pi
+### Initial GGML Profiling on the Pi with Intel TMA Method
 I will start with an initial benchmark T₀ of GGML with TinyLlama using 512 tokens for the prompt, 128 tokens for the generation, and one thread. I will it on an isolated core.
 ```bash
 # T₀
@@ -193,7 +193,7 @@ brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ taskset -c 2 ./exter
 build: a3cb0474 (6735)
 ```
 
-I like to start by collecting initial performance measurements with perf. These include CPU time, and a handful inspired from Intel Top-Down Microarchitecture Analysis Method. For Cortex A-76, the relevant PMU events (https://developer.arm.com/documentation/100798/0401/Performance-Monitoring-Unit/PMU-events) are instructions_retired, instructions_speculated, branch_misspredictions, frontend_stalls, backend_stalls, and cycles. This covers the various categorie the program can be underperforming (https://easyperf.net/blog/2019/02/09/Top-Down-performance-analysis-methodology).
+I like to start by collecting initial performance measurements with perf. These include CPU time, and a handful inspired from Intel Top-Down Microarchitecture Analysis Method. For Cortex A-76, the relevant PMU events (https://developer.arm.com/documentation/100798/0401/Performance-Monitoring-Unit/PMU-events) are instructions_retired, instructions_speculated, branch_misspredictions, frontend_stalls, backend_stalls, and cycles. This covers the various categories the program can be underperforming (https://easyperf.net/blog/2019/02/09/Top-Down-performance-analysis-methodology).
 <details>
   <summary><b>Click to Expand</b></summary>
 
@@ -375,7 +375,10 @@ brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf report --s
 ![Flame Graph](artifacts/perf/flame.svg)
 
 So, clearly a lot of CPU time is being spent in `ggml_vec_dot_q4_K_q8_K`, with a bit over half of the time spent in the function itself and the rest of the time spent in the few functions it is calling.
-Next, I need to know what the code is doing, and unfortunately there are a lot of preprocessor feature-based branches, so I gotta figure out exactly what is running and what isn't.
+#### Pipeline Slots
+From the perf stat measurements, we can see 0.17% of cycles where there are no fetched instructions available to dispatch are stalled. This area, then, is not our biggest problem. We also see our branch mispredict rate per instruction retired is 0.01%, and instructions discarded per cycle, (inst_spec - inst_retired)/cycles is 0.0086. Bad speculation, then, does not seem to be an issue. On the other hand, examining backend performance, we see that for 15% of cycles, fetched instructions are not able to dispatch due to resource constaints (https://developer.arm.com/documentation/100798/0401/Performance-Monitoring-Unit/PMU-events). I next want to look more closely at measurements that can indicate why we are backend-bound.
+
+But first, I want to know what the code is doing, and unfortunately there are a handful of preprocessor feature-based branches, so I gotta figure out exactly what is running and what isn't.
 We can first see what is default defined:
 
 ```bash
@@ -513,8 +516,92 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
 </details>
 
+Comparing with the original source file confirms the `__ARM_FEATURE_MATMUL_INT8` and `__ARM_FEATURE_SVE` branches were omitted and that the only branch hit is the section under `__ARM_NEON`.
 
-Comparing with the original source file confirms the `__ARM_FEATURE_MATMUL_INT8` and `__ARM_FEATURE_SVE` branches were omitted and that the only branch hit is the section under `__ARM_NEON`. Now that I know where to look in my IDE, I think it is worth seeing with more granularity where CPU cycles are spent in the function when sampled. Additionally, it is worth getting program-wide statistics such as IPC and cache misses.
+Back to profiling, I will look more closely at why performance is so backend-bound. I will collect some measurements that suggest the performance is core-bound and some that suggest the performance is memory-bound. Looking at speculative instructions for loads, stores, integer data-processing, advanced SIMD, and floating point processing, relative to total cycles can suggest
+
+
+```bash
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e LD_SPEC,ST_SPEC,DP_SPEC,VFP_SPEC,ASE_SPEC,\
+STALL_BACKEND,cycles  taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.83 ± 0.01 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+    73,816,373,984      LD_SPEC
+     6,420,251,582      ST_SPEC
+   160,079,149,795      DP_SPEC
+    20,234,922,631      VFP_SPEC
+   176,495,748,475      ASE_SPEC
+    26,071,714,673      STALL_BACKEND
+   173,293,925,291      cycles
+
+      72.261269041 seconds time elapsed
+
+      72.692806000 seconds user
+       0.019987000 seconds sys
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## OLDER STUFF
+Additionally, it is worth getting program-wide statistics such as IPC and cache misses.
 
 <details>
 <summary>Click to expand full annotation</summary>
