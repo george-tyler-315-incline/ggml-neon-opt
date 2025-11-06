@@ -1,10 +1,6 @@
-# ggml-neon-opt
+# ggml-neon-opt - Work In Progress
 The goal of this repository is to optimize the ggml library for ARM Neon processors and achieve as high of a performance as I can on my Raspberry Pi 5. I hope to learn more about ML, and enjoy doing more with my Raspberry Pi.
 My Raspberry Pi 5 is a 4 core ARM Cortex-A76 with 16GB of RAM. Cores 2 and 3 are isolated. This documentation is not an exact representation of my workflow, was much written retrospectively in the interest of making this more readable.
-
-## Summary of Results
-- initial benchmarks
-- optimized benchmarks
 
 ## Getting Started
 ### Prerequisites
@@ -194,8 +190,6 @@ build: a3cb0474 (6735)
 ```
 
 I like to start by collecting initial performance measurements with perf. These include CPU time, and a handful inspired from Intel Top-Down Microarchitecture Analysis Method. For Cortex A-76, the relevant PMU events (https://developer.arm.com/documentation/100798/0401/Performance-Monitoring-Unit/PMU-events) are instructions_retired, instructions_speculated, branch_misspredictions, frontend_stalls, backend_stalls, and cycles. This covers the various categories the program can be underperforming (https://easyperf.net/blog/2019/02/09/Top-Down-performance-analysis-methodology).
-<details>
-  <summary><b>Click to Expand</b></summary>
 
 ```bash
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e inst_retired,inst_spec,br_mis_pred,stall_frontend,stall_backend,cycles taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
@@ -220,6 +214,28 @@ build: a3cb0474 (6735)
 
       72.587292000 seconds user
        0.023977000 seconds sys
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e br_mis_pred,br_retired taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.79 ± 0.02 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+        49,802,353      br_mis_pred
+    15,812,474,037      br_retired
+
+      72.514991124 seconds time elapsed
+
+      72.950628000 seconds user
+       0.019988000 seconds sys
+
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
 
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf record -e cycles -F 999 -g --call-graph=dwarf taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
 ...
@@ -370,243 +386,7 @@ brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf report --s
             |          ggml_backend_sched_graph_compute_async
             |          ggml_backend_sched_graph_compute_async
             |          llama_context::graph_compute(ggml_cgraph*, bool)
-```
-</details>
-![Flame Graph](artifacts/perf/flame.svg)
 
-So, clearly a lot of CPU time is being spent in `ggml_vec_dot_q4_K_q8_K`, with a bit over half of the time spent in the function itself and the rest of the time spent in the few functions it is calling.
-#### Pipeline Slots
-From the perf stat measurements, we can see 0.17% of cycles where there are no fetched instructions available to dispatch are stalled. This area, then, is not our biggest problem. We also see our branch mispredict rate per instruction retired is 0.01%, and instructions discarded per cycle, (inst_spec - inst_retired)/cycles is 0.0086. Bad speculation, then, does not seem to be an issue. On the other hand, examining backend performance, we see that for 15% of cycles, fetched instructions are not able to dispatch due to resource constaints (https://developer.arm.com/documentation/100798/0401/Performance-Monitoring-Unit/PMU-events). I next want to look more closely at measurements that can indicate why we are backend-bound.
-
-But first, I want to know what the code is doing, and unfortunately there are a handful of preprocessor feature-based branches, so I gotta figure out exactly what is running and what isn't.
-We can first see what is default defined:
-
-```bash
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ echo | gcc -march=native -E -dM - | grep -e 'ARM_FEATURE_' -e 'NEON' -e 'MATMUL'
-#define __ARM_FEATURE_ATOMICS 1
-#define __ARM_FEATURE_AES 1
-#define __ARM_FEATURE_IDIV 1
-#define __ARM_FEATURE_DOTPROD 1
-#define __ARM_FEATURE_CRYPTO 1
-#define __ARM_FEATURE_FP16_SCALAR_ARITHMETIC 1
-#define __ARM_FEATURE_CLZ 1
-#define __ARM_FEATURE_QRDMX 1
-#define __ARM_FEATURE_FMA 1
-#define __ARM_FEATURE_SHA2 1
-#define __ARM_FEATURE_FP16_VECTOR_ARITHMETIC 1
-#define __ARM_FEATURE_UNALIGNED 1
-#define __ARM_FEATURE_CRC32 1
-#define __ARM_NEON 1
-#define __ARM_FEATURE_NUMERIC_MAXMIN 1
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
-```
-
-So it seems we don't have SVE and we don't have MATMUL_I8. We can do a sanity check by seeing how the processor treats the source file. From `external/llama.cpp/build/compile_commands.json`:
-```
-{
-  "directory": "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/build/ggml/src",
-  "command": "/usr/bin/cc -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/.. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/../include -O2 -g -DNDEBUG -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -mcpu=cortex-a76+crypto+dotprod+noi8mm+nosve -fopenmp -std=gnu11 -o CMakeFiles/ggml-cpu.dir/ggml-cpu/arch/arm/quants.c.o -c /home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c",
-  "file": "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
-},
-```
-It seems `-mcpu=cortex-a76+crypto+dotprod+noi8mm+nosve` also confirms we don't have i8mm or sve. I will modify the command to dump the preprocessed file though via gcc -E.
-```bash
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt/external/llama.cpp/build/ggml/src $ /usr/bin/cc -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/.. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/../include -O2 -g -DNDEBUG -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -mcpu=cortex-a76+crypto+dotprod+noi8mm+nosve -fopenmp -std=gnu11 -o ~/dev/transformers/ggml-neon-opt/preprocessed_arm_quants.c.txt -E /home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c
-```
-
-<details>
-  <summary><b>The preprocessed file reveals this as the source. Click to Expand</b></summary>
-
-```c
-void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
-
-# 2127 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c" 3 4
-   ((void) (0))
-# 2127 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
-                        ;
-
-
-
-
-# 2131 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c" 3 4
-   ((void) (0))
-# 2131 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
-                   ;
-
-    (void)(nrc);
-    (void)(bx);
-    (void)(by);
-    (void)(bs);
-
-    const block_q4_K * restrict x = vx;
-    const block_q8_K * restrict y = vy;
-
-    const int nb = n / 256;
-
-    static const uint32_t kmask1 = 0x3f3f3f3f;
-    static const uint32_t kmask2 = 0x0f0f0f0f;
-    static const uint32_t kmask3 = 0x03030303;
-
-    uint32_t utmp[4];
-# 2371 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
-    const uint8x16_t m4b = vdupq_n_u8(0xf);
-    const int32x4_t mzero = vdupq_n_s32(0);
-
-    int8x16x2_t q4bytes;
-    int8x16x2_t q8bytes;
-
-    float sumf = 0;
-
-    for (int i = 0; i < nb; ++i) {
-
-        const float d = y[i].d * neon_compute_fp16_to_fp32(x[i].d);
-        const float dmin = y[i].d * neon_compute_fp16_to_fp32(x[i].dmin);
-
-        const int16x8_t q8sums = vpaddq_s16(vld1q_s16(y[i].bsums), vld1q_s16(y[i].bsums + 8));
-
-        memcpy(utmp, x[i].scales, 12);
-
-        uint32x2_t mins8 = { 0 };
-        mins8 = vset_lane_u32(utmp[1] & kmask1, mins8, 0);
-        mins8 = vset_lane_u32(((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4), mins8, 1);
-
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[0] &= kmask1;
-
-        const int16x8_t mins = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
-        const int32x4_t prod = vaddq_s32(vmull_s16(vget_low_s16 (q8sums), vget_low_s16 (mins)),
-                                         vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)));
-        sumf -= dmin * vaddvq_s32(prod);
-
-        const uint8_t * scales = (const uint8_t *)utmp;
-
-        const uint8_t * restrict q4 = x[i].qs;
-        const int8_t * restrict q8 = y[i].qs;
-
-        int32_t sumi1 = 0;
-        int32_t sumi2 = 0;
-
-        for (int j = 0; j < 256/64; ++j) {
-            const uint8x16x2_t q4bits = vld1q_u8_x2(q4); q4 += 32;
-
-            q8bytes = vld1q_s8_x2(q8); q8 += 32;
-            q4bytes.val[0] = vreinterpretq_s8_u8(vandq_u8 (q4bits.val[0], m4b));
-            q4bytes.val[1] = vreinterpretq_s8_u8(vandq_u8 (q4bits.val[1], m4b));
-
-            const int32x4_t p1 = vdotq_s32(vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
-            sumi1 += vaddvq_s32(p1) * scales[2*j+0];
-
-            q8bytes = vld1q_s8_x2(q8); q8 += 32;
-            q4bytes.val[0] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[0], 4));
-            q4bytes.val[1] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[1], 4));
-
-            const int32x4_t p2 = vdotq_s32(vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
-
-            sumi2 += vaddvq_s32(p2) * scales[2*j+1];
-        }
-
-        sumf += d * (sumi1 + sumi2);
-
-    }
-
-    *s = sumf;
-# 2490 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
-}
-```
-
-</details>
-
-Comparing with the original source file confirms the `__ARM_FEATURE_MATMUL_INT8` and `__ARM_FEATURE_SVE` branches were omitted and that the only branch hit is the section under `__ARM_NEON`.
-
-Back to profiling, I will look more closely at why performance is so backend-bound. I will collect some measurements that suggest the performance is core-bound and some that suggest the performance is memory-bound. Looking at speculative instructions for loads, stores, integer data-processing, advanced SIMD, and floating point processing, relative to total cycles can suggest
-
-
-```bash
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e LD_SPEC,ST_SPEC,DP_SPEC,VFP_SPEC,ASE_SPEC,\
-STALL_BACKEND,cycles  taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
-Events disabled
-| model                          |       size |     params | backend    | threads |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-Events enabled
-| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.83 ± 0.01 |
-
-build: a3cb0474 (6735)
-
- Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
-
-    73,816,373,984      LD_SPEC
-     6,420,251,582      ST_SPEC
-   160,079,149,795      DP_SPEC
-    20,234,922,631      VFP_SPEC
-   176,495,748,475      ASE_SPEC
-    26,071,714,673      STALL_BACKEND
-   173,293,925,291      cycles
-
-      72.261269041 seconds time elapsed
-
-      72.692806000 seconds user
-       0.019987000 seconds sys
-
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## OLDER STUFF
-Additionally, it is worth getting program-wide statistics such as IPC and cache misses.
-
-<details>
-<summary>Click to expand full annotation</summary>
-
-```bash
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf annotate --stdio --print-line --full-paths -s ggml_vec_dot_q4_K_q8_K --percent-limit 5
 
 Sorted summary for file /home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/build/bin/libggml-cpu.so
@@ -849,10 +629,234 @@ Sorted summary for file /home/brandonneway/dev/transformers/ggml-neon-opt/extern
     0.00 :   5baf4:  ret
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
 ```
+
+![Flame Graph](artifacts/perf/flame.svg)
+
+So, clearly a lot of CPU time is being spent in `ggml_vec_dot_q4_K_q8_K`, with a bit over half of the time spent in the function itself and the rest of the time spent in the few functions it is calling.
+
+#### Pipeline Slots
+From the perf stat measurements, we can see 0.17% of cycles where there are no fetched instructions available to dispatch are stalled. This area, then, is not our biggest problem. We also see our branch mispredict rate per instruction retired is 0.01%, our branch mispredict rate per branch is 0.3%, and instructions discarded per cycle, (inst_spec - inst_retired)/cycles, is 0.0086. Bad speculation, then, does not seem to be an issue. On the other hand, examining backend performance, we see that for 15% of cycles, fetched instructions are not able to dispatch due to resource constaints (https://developer.arm.com/documentation/100798/0401/Performance-Monitoring-Unit/PMU-events). I next want to look more closely at measurements that can indicate why we are backend-bound.
+
+But first, I want to know what the code is doing, and unfortunately there are a handful of preprocessor feature-based branches, so I gotta figure out exactly what is running and what isn't.
+We can first see what is default defined:
+
+```bash
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ echo | gcc -march=native -E -dM - | grep -e 'ARM_FEATURE_' -e 'NEON' -e 'MATMUL'
+#define __ARM_FEATURE_ATOMICS 1
+#define __ARM_FEATURE_AES 1
+#define __ARM_FEATURE_IDIV 1
+#define __ARM_FEATURE_DOTPROD 1
+#define __ARM_FEATURE_CRYPTO 1
+#define __ARM_FEATURE_FP16_SCALAR_ARITHMETIC 1
+#define __ARM_FEATURE_CLZ 1
+#define __ARM_FEATURE_QRDMX 1
+#define __ARM_FEATURE_FMA 1
+#define __ARM_FEATURE_SHA2 1
+#define __ARM_FEATURE_FP16_VECTOR_ARITHMETIC 1
+#define __ARM_FEATURE_UNALIGNED 1
+#define __ARM_FEATURE_CRC32 1
+#define __ARM_NEON 1
+#define __ARM_FEATURE_NUMERIC_MAXMIN 1
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
+```
+
+So it seems we don't have SVE and we don't have MATMUL_I8. We can do a sanity check by seeing how the processor treats the source file. From `external/llama.cpp/build/compile_commands.json`:
+```
+{
+  "directory": "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/build/ggml/src",
+  "command": "/usr/bin/cc -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/.. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/../include -O2 -g -DNDEBUG -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -mcpu=cortex-a76+crypto+dotprod+noi8mm+nosve -fopenmp -std=gnu11 -o CMakeFiles/ggml-cpu.dir/ggml-cpu/arch/arm/quants.c.o -c /home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c",
+  "file": "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
+},
+```
+It seems `-mcpu=cortex-a76+crypto+dotprod+noi8mm+nosve` also confirms we don't have i8mm or sve. I will modify the command to dump the preprocessed file though via gcc -E.
+```bash
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt/external/llama.cpp/build/ggml/src $ /usr/bin/cc -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/.. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/../include -O2 -g -DNDEBUG -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -mcpu=cortex-a76+crypto+dotprod+noi8mm+nosve -fopenmp -std=gnu11 -o ~/dev/transformers/ggml-neon-opt/preprocessed_arm_quants.c.txt -E /home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c
+```
+
+<details>
+  <summary><b>The preprocessed file reveals this as the source. Click to Expand</b></summary>
+
+```c
+void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+
+# 2127 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c" 3 4
+   ((void) (0))
+# 2127 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
+                        ;
+
+
+
+
+# 2131 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c" 3 4
+   ((void) (0))
+# 2131 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
+                   ;
+
+    (void)(nrc);
+    (void)(bx);
+    (void)(by);
+    (void)(bs);
+
+    const block_q4_K * restrict x = vx;
+    const block_q8_K * restrict y = vy;
+
+    const int nb = n / 256;
+
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+# 2371 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
+    const uint8x16_t m4b = vdupq_n_u8(0xf);
+    const int32x4_t mzero = vdupq_n_s32(0);
+
+    int8x16x2_t q4bytes;
+    int8x16x2_t q8bytes;
+
+    float sumf = 0;
+
+    for (int i = 0; i < nb; ++i) {
+
+        const float d = y[i].d * neon_compute_fp16_to_fp32(x[i].d);
+        const float dmin = y[i].d * neon_compute_fp16_to_fp32(x[i].dmin);
+
+        const int16x8_t q8sums = vpaddq_s16(vld1q_s16(y[i].bsums), vld1q_s16(y[i].bsums + 8));
+
+        memcpy(utmp, x[i].scales, 12);
+
+        uint32x2_t mins8 = { 0 };
+        mins8 = vset_lane_u32(utmp[1] & kmask1, mins8, 0);
+        mins8 = vset_lane_u32(((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4), mins8, 1);
+
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[0] &= kmask1;
+
+        const int16x8_t mins = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
+        const int32x4_t prod = vaddq_s32(vmull_s16(vget_low_s16 (q8sums), vget_low_s16 (mins)),
+                                         vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)));
+        sumf -= dmin * vaddvq_s32(prod);
+
+        const uint8_t * scales = (const uint8_t *)utmp;
+
+        const uint8_t * restrict q4 = x[i].qs;
+        const int8_t * restrict q8 = y[i].qs;
+
+        int32_t sumi1 = 0;
+        int32_t sumi2 = 0;
+
+        for (int j = 0; j < 256/64; ++j) {
+            const uint8x16x2_t q4bits = vld1q_u8_x2(q4); q4 += 32;
+
+            q8bytes = vld1q_s8_x2(q8); q8 += 32;
+            q4bytes.val[0] = vreinterpretq_s8_u8(vandq_u8 (q4bits.val[0], m4b));
+            q4bytes.val[1] = vreinterpretq_s8_u8(vandq_u8 (q4bits.val[1], m4b));
+
+            const int32x4_t p1 = vdotq_s32(vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+            sumi1 += vaddvq_s32(p1) * scales[2*j+0];
+
+            q8bytes = vld1q_s8_x2(q8); q8 += 32;
+            q4bytes.val[0] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[0], 4));
+            q4bytes.val[1] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[1], 4));
+
+            const int32x4_t p2 = vdotq_s32(vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+
+            sumi2 += vaddvq_s32(p2) * scales[2*j+1];
+        }
+
+        sumf += d * (sumi1 + sumi2);
+
+    }
+
+    *s = sumf;
+# 2490 "/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c"
+}
+```
+
 </details>
 
+Comparing with the original source file confirms the `__ARM_FEATURE_MATMUL_INT8` and `__ARM_FEATURE_SVE` branches were omitted and that the only branch hit is the section under `__ARM_NEON`.
 
-I think it makes sense to get statistics next to see if we can get more information about why these instructions are likely stalling.
+#### Examining Backend
+
+Back to profiling, I will look more closely at why performance is so backend-bound. I will collect some measurements that suggest the performance is core-bound and then some that suggest the performance is memory-bound.
+
+##### Examining Core-Bound
+Looking at speculative instructions for loads, stores, integer data-processing, advanced SIMD, and floating point processing, relative to total cycles provides evidence or for against execution unit saturation, one way a performance bottleneck is core-bound.
+
+```bash
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e LD_SPEC,ST_SPEC,DP_SPEC,VFP_SPEC,ASE_SPEC,STALL_BACKEND,cycles  taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.83 ± 0.01 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+    73,816,373,984      LD_SPEC
+     6,420,251,582      ST_SPEC
+   160,079,149,795      DP_SPEC
+    20,234,922,631      VFP_SPEC
+   176,495,748,475      ASE_SPEC
+    26,071,714,673      STALL_BACKEND
+   173,293,925,291      cycles
+
+      72.261269041 seconds time elapsed
+
+      72.692806000 seconds user
+       0.019987000 seconds sys
+
+```
+
+I suppose evidence of execution-unit saturation might look like the instruction per cycle rate for a certain pipeline being larger than its max throughput. Maybe I am overthinking it, but I don't see it sufficient to simply divide these counts by cycles and compare to the number of pipelines that can serve that category, since not all the Cortex A76 pipelines are equivalent even for a given category. I think we can come up with a decent average-case estimate of pipeline utilization and if that does not appear to be cause for a bottleneck, then I am comfortable to say pipeline saturation is not a bottleneck.
+For a given pipeline P, which can accept a new instruction each cycle, there is saturation if the instructions per cycle through P exceeds one. The average per cycle rate of instructions which go through P includes the instructions that can be executed by P and only P, along with the equally shared rate of instructions which can go through P and n other pipelines.
+
+$$
+\text{Utilization}_P = \sum_{\substack{
+        i \in \\
+            \text{instructions}\\
+              \text{that can go}\\
+              \text{through } P
+    }} \frac{r_i}{n}, \quad m_i = \text{number of pipelines that can execute instruction } i, \quad r_i = \text{per-cycle rate of } i
+$$
+
+According to https://en.wikichip.org/wiki/arm_holdings/microarchitectures/cortex-a76#Execution_Units, there are two ASIMD/FP pipelines, three integer pipelines, and two load/store pipelines. The official Cortex A76 software optimization guide (https://developer.arm.com/documentation/pjdoc466751330-7215/latest/) gives more detail on each pipeline.
+
+![Cortex A-76](artifacts/cortex-a76.svg).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## OLDER STUFF
 
 ```bash
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat -e cycles,instructions,cache-misses,cache-references,L1-dcache-load-misses,L1-dcache-loads taskset -c 2 ./external/llama.cpp/build/bin/llama-bench  -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
@@ -879,7 +883,6 @@ build: a3cb0474 (6735)
 ```
 
 
-I'll zoom in again on the problem area, looking specifically at cache misses.
 ```bash
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf record -e cache-misses -F 1000  taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
 | model                          |       size |     params | backend    | threads |            test |                  t/s |
@@ -1154,20 +1157,5 @@ Sorted summary for file /home/brandonneway/dev/transformers/ggml-neon-opt/extern
          : 216   *s = sumf;
     0.00 :   5c030:  str     s4, [x1]
     0.00 :   5c034:  ret
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
-```
-
-
-
-I will look at IPC next...
-```bash
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf record -e cycles,instructions -F 1000  taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
-| model                          |       size |     params | backend    | threads |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.37 ± 0.05 |
-
-build: a3cb0474 (6735)
-[ perf record: Woken up 29 times to write data ]
-[ perf record: Captured and wrote 7.033 MB perf.data (153254 samples) ]
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
 ```
