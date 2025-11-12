@@ -828,6 +828,9 @@ According to https://en.wikichip.org/wiki/arm_holdings/microarchitectures/cortex
 ![Cortex A-76](artifacts/cortex-a76.svg).
 
 
+i will return to this
+
+##### Examining Memory-Bound
 
 
 
@@ -844,7 +847,219 @@ According to https://en.wikichip.org/wiki/arm_holdings/microarchitectures/cortex
 
 
 
+more measurements...
 
+```bash
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_REFILL,L2D_CACHE,L2D_CACHE_REFILL,cycles,STALL_BACKEND taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.84 ± 0.02 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+   118,461,317,339      L1D_CACHE
+       695,145,948      L1D_CACHE_REFILL
+    13,118,245,162      L2D_CACHE
+       332,089,576      L2D_CACHE_REFILL
+   174,006,342,426      cycles
+    25,948,760,386      STALL_BACKEND
+
+      72.883211213 seconds time elapsed
+
+      72.586759000 seconds user
+       0.071951000 seconds sys
+
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L3D_CACHE_RD,L3D_CACHE_REFILL,BUS_ACCESS_RD,BUS_ACCESS_WR,BUS_CYCLES,cycles taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.60 ± 0.05 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+     6,528,096,251      L3D_CACHE_RD
+     6,328,032,204      L3D_CACHE_REFILL
+    26,112,411,218      BUS_ACCESS_RD
+    26,118,910,342      BUS_ACCESS_WR
+   177,902,410,214      BUS_CYCLES
+   177,902,434,669      cycles
+
+      74.177960150 seconds time elapsed
+
+      74.607544000 seconds user
+       0.023985000 seconds sys
+
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e MEM_ACCESS_RD,MEM_ACCESS_WR,LL_CACHE_MISS_RD,REMOTE_ACCESS,cycles  taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.70 ± 0.04 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+   111,179,627,116      MEM_ACCESS_RD
+     6,642,929,868      MEM_ACCESS_WR
+     6,340,630,955      LL_CACHE_MISS_RD
+                 0      REMOTE_ACCESS
+   175,841,658,671      cycles
+
+      73.314054184 seconds time elapsed
+
+      73.746620000 seconds user
+       0.023986000 seconds sys
+
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo shutdown now
+
+Broadcast message from root@raspberrypi on pts/0 (Mon 2025-11-10 21:56:08 PST):
+
+The system will power off now!
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ Connection to raspberrypi.local closed by remote host.
+Connection to raspberrypi.local closed.
+(base) λ ~/
+(base) λ ~/
+(base) λ ~/
+(base) λ ~/
+(base) λ ~/
+(base) λ ~/
+(base) λ ~/
+(base) λ ~/
+(base) λ ~/
+(base) λ ~/
+(base) λ ~/ ssh brandonneway@raspberrypi.local
+Linux raspberrypi 6.12.34+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.34-1+rpt1~bookworm (2025-06-26) aarch64
+
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+Last login: Mon Nov 10 21:56:17 2025
+brandonneway@raspberrypi:~ $
+brandonneway@raspberrypi:~ $ cd dev/transformers/ggml-neon-opt/
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ ls
+artifacts  external  LICENSE  models  perf.data  preprocessed_arm_quants.c.txt  README.md
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_RD,L1D_CACHE_WR,L1D_CACHE_REFILL,L1D_CACHE_REFILL_RD,L1D_CACHE_REFILL_WR,L1D_CACHE_REFILL_INNER,L1D_CACHE_REFILL_OUTER askset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+Events enabled
+Workload failed: No such file or directory
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_RD,L1D_CACHE_WR,L1D_CACHE_REFILL,L1D_CACHE_REFILL_RD,L1D_CACHE_REFILL_WR,L1D_CACHE_REFILL_INNER,L1D_CACHE_REFILL_OUTER taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.83 ± 0.02 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+   118,357,216,203      L1D_CACHE                                                               (75.00%)
+   111,832,981,523      L1D_CACHE_RD                                                            (74.99%)
+     6,702,270,647      L1D_CACHE_WR                                                            (74.99%)
+       693,783,690      L1D_CACHE_REFILL                                                        (75.01%)
+       656,811,160      L1D_CACHE_REFILL_RD                                                     (75.01%)
+        37,131,581      L1D_CACHE_REFILL_WR                                                     (75.00%)
+       567,991,262      L1D_CACHE_REFILL_INNER                                                  (74.99%)
+       126,560,501      L1D_CACHE_REFILL_OUTER                                                  (74.99%)
+
+      72.949835165 seconds time elapsed
+
+      72.601574000 seconds user
+       0.083909000 seconds sys
+
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_RD,L1D_CACHE_WR,L1D_CACHE_REFILL,L1D_CACHE_REFILL_RD,L1D_CACHE_REFILL_WR taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+
+
+
+
+
+
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.79 ± 0.01 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+   117,866,278,011      L1D_CACHE
+   111,219,203,977      L1D_CACHE_RD
+     6,647,072,100      L1D_CACHE_WR
+       701,933,983      L1D_CACHE_REFILL
+       670,649,227      L1D_CACHE_REFILL_RD
+        31,284,711      L1D_CACHE_REFILL_WR
+
+      72.611524639 seconds time elapsed
+
+      72.996497000 seconds user
+       0.027968000 seconds sys
+
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_RD,L1D_CACHE_WR,L1D_CACHE_REFILL,L1D_CACHE_WB taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.78 ± 0.03 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+   117,873,482,150      L1D_CACHE
+   111,226,120,507      L1D_CACHE_RD
+     6,647,359,075      L1D_CACHE_WR
+       720,178,397      L1D_CACHE_REFILL
+        57,481,472      L1D_CACHE_WB
+
+      72.703296001 seconds time elapsed
+
+      73.094244000 seconds user
+       0.019976000 seconds sys
+
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE_REFILL,L1D_CACHE_REFILL_INNER,L1D_CACHE_REFILL_OUTER,cycles taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.77 ± 0.04 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+       718,165,956      L1D_CACHE_REFILL
+       569,261,662      L1D_CACHE_REFILL_INNER
+       148,904,245      L1D_CACHE_REFILL_OUTER
+   174,291,106,083      cycles
+
+      72.708145456 seconds time elapsed
+
+      73.107033000 seconds user
+       0.019977000 seconds sys
+
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
+```
 
 
 
