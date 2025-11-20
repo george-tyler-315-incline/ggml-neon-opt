@@ -2,6 +2,8 @@
 The goal of this repository is to optimize the ggml library for ARM Neon processors and achieve as high of a performance as I can on my Raspberry Pi 5. I hope to learn more about ML, and enjoy doing more with my Raspberry Pi.
 My Raspberry Pi 5 is a 4 core ARM Cortex-A76 with 16GB of RAM. Cores 2 and 3 are isolated. This documentation is not an exact representation of my workflow, was much written retrospectively in the interest of making this more readable.
 
+![Raspberry Pi With Freenove Case](artifacts/pi.jpg)
+
 ## Getting Started
 ### Prerequisites
 Make sure to have arm neon and `sudo apt install build-essential linux-tools-$(uname -r) linux-perf libopenblas-dev libcurl4-openssl-dev libomp-dev wget`
