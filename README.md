@@ -1063,10 +1063,264 @@ build: a3cb0474 (6735)
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
 ```
 
+Taking a slightly different approach, I am going to modify the code to preserve the loads, but reduce the arithmetic NEON operations in the tight loop, to see if there is a speedup. If there is, it suggests the ASIMD pipelines were saturated.
+
+```c
+void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    //....
+#elif defined __ARM_NEON
+    const uint8x16_t m4b = vdupq_n_u8(0xf);
+    const int32x4_t mzero = vdupq_n_s32(0);
+
+    ggml_int8x16x2_t q4bytes;
+    ggml_int8x16x2_t q8bytes;
+
+    float sumf = 0;
+
+    for (int i = 0; i < nb; ++i) {
+
+        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float dmin = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        const int16x8_t q8sums = vpaddq_s16(vld1q_s16(y[i].bsums), vld1q_s16(y[i].bsums + 8));
+
+        memcpy(utmp, x[i].scales, 12);
+
+        uint32x2_t mins8 = { 0 };
+        mins8 = vset_lane_u32(utmp[1] & kmask1, mins8, 0);
+        mins8 = vset_lane_u32(((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4), mins8, 1);
+
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[0] &= kmask1;
+
+        const int16x8_t mins = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
+        const int32x4_t prod = vaddq_s32(vmull_s16(vget_low_s16 (q8sums), vget_low_s16 (mins)),
+                                         vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)));
+        sumf -= dmin * vaddvq_s32(prod);
+
+        const uint8_t * scales = (const uint8_t *)utmp;
+
+        const uint8_t * GGML_RESTRICT q4 = x[i].qs;
+        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
+
+        int32_t sumi1 = 0;
+        int32_t sumi2 = 0;
+
+        volatile int bleh = 0;
+
+        for (int j = 0; j < QK_K/64; ++j) {
+            const ggml_uint8x16x2_t q4bits = ggml_vld1q_u8_x2(q4); q4 += 32;
+
+            q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+            // q4bytes.val[0] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[0], m4b));
+            // q4bytes.val[1] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[1], m4b));
+
+            bleh += vaddvq_u8(q4bits.val[0]) + vaddvq_u8(q4bits.val[1]);
+            bleh += vaddvq_s8(q8bytes.val[0]) + vaddvq_s8(q8bytes.val[1]);
+
+            // const int32x4_t p1 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+            // sumi1 += vaddvq_s32(p1) * scales[2*j+0];
+
+            q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+            // q4bytes.val[0] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[0], 4));
+            // q4bytes.val[1] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[1], 4));
+
+            // const int32x4_t p2 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+
+            // sumi2 += vaddvq_s32(p2) * scales[2*j+1];
+
+            bleh += vaddvq_s8(q8bytes.val[0]) + vaddvq_s8(q8bytes.val[1]);
+        }
+
+        sumf += d * (sumi1 + sumi2) + bleh;
+
+    }
+
+    *s = sumf;
+}
+```
+
+```bash
+cmake -S external/llama.cpp -B external/llama.cpp/build_with_loads_but_less_neon \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DGGML_NATIVE=ON \
+  -DGGML_BLAS=ON \
+  -DGGML_BLAS_VENDOR=OpenBLAS \
+  -DGGML_OPENMP=ON \
+  -DLLAMA_CURL=OFF \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+taskset -c 1,2,3 cmake --build external/llama.cpp/build_with_loads_but_less_neon/ --verbose -j
+...
+sudo perf stat --delay 500 -e LD_SPEC,ST_SPEC,DP_SPEC,VFP_SPEC,ASE_SPEC,STALL_BACKEND,cycles  taskset -c 2 ./external/llama.cpp/build_with_loads_but_less_neon/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          6.30 ± 0.01 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build_with_loads_but_less_neon/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+    84,524,620,023      LD_SPEC
+    33,969,802,140      ST_SPEC
+   194,117,164,867      DP_SPEC
+    22,540,688,609      VFP_SPEC
+   134,048,178,563      ASE_SPEC
+    39,609,092,086      STALL_BACKEND
+   243,202,963,199      cycles
+
+     101.381206602 seconds time elapsed
+
+     101.808524000 seconds user
+       0.031987000 seconds sys
+```
+
+Weirdly, the token generation is actually slower...so I will try another approach of preserving the ASIMD operations but removing the loads by using junk data. If this improves performance, it suggests memory bandwidth was a bottleneck.
+
+```c
+void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    //....
+#elif defined __ARM_NEON
+    const uint8x16_t m4b = vdupq_n_u8(0xf);
+    const int32x4_t mzero = vdupq_n_s32(0);
+
+    ggml_int8x16x2_t q4bytes;
+    ggml_int8x16x2_t q8bytes;
+
+    uint8_t dummy_q4[32];
+    int8_t dummy_q8[32];
+    
+    // Initialize with junk
+    memset(dummy_q4, 0x0F, 32);
+    memset(dummy_q8, 0x01, 32);
+
+    float sumf = 0;
+
+    for (int i = 0; i < nb; ++i) {
+
+        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float dmin = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        const int16x8_t q8sums = vpaddq_s16(vld1q_s16(y[i].bsums), vld1q_s16(y[i].bsums + 8));
+
+        memcpy(utmp, x[i].scales, 12);
+
+        uint32x2_t mins8 = { 0 };
+        mins8 = vset_lane_u32(utmp[1] & kmask1, mins8, 0);
+        mins8 = vset_lane_u32(((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4), mins8, 1);
+
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[0] &= kmask1;
+
+        const int16x8_t mins = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
+        const int32x4_t prod = vaddq_s32(vmull_s16(vget_low_s16 (q8sums), vget_low_s16 (mins)),
+                                         vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)));
+        sumf -= dmin * vaddvq_s32(prod);
+
+        const uint8_t * scales = (const uint8_t *)utmp;
+
+        const uint8_t * GGML_RESTRICT q4 = x[i].qs;
+        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
+
+        int32_t sumi1 = 0;
+        int32_t sumi2 = 0;
+
+        for (int j = 0; j < QK_K/64; ++j) {
+            const ggml_uint8x16x2_t q4bits = ggml_vld1q_u8_x2(dummy_q4); q4 += 32;
+
+            q8bytes = ggml_vld1q_s8_x2(dummy_q8); q8 += 32;
+            q4bytes.val[0] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[0], m4b));
+            q4bytes.val[1] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[1], m4b));
+
+            const int32x4_t p1 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+            sumi1 += vaddvq_s32(p1) * scales[2*j+0];
+
+            q8bytes = ggml_vld1q_s8_x2(dummy_q8); q8 += 32;
+            q4bytes.val[0] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[0], 4));
+            q4bytes.val[1] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[1], 4));
+
+            const int32x4_t p2 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+
+            sumi2 += vaddvq_s32(p2) * scales[2*j+1];
+        }
+
+        sumf += d * (sumi1 + sumi2);
+
+    }
+
+    *s = sumf;
+}
+```
+
+This time, the token generation remained at the baseline value T0. 
+
+```bash
+udo perf stat --delay 500 -e LD_SPEC,ST_SPEC,DP_SPEC,VFP_SPEC,ASE_SPEC,STALL_BACKEND,cycles  taskset -c 2 ./external/llama.cpp/build_with_loads_but_less_neon/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.60 ± 0.01 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build_with_loads_but_less_neon/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+    69,650,702,059      LD_SPEC
+     9,029,849,886      ST_SPEC
+   139,030,512,835      DP_SPEC
+    20,275,056,382      VFP_SPEC
+   176,827,358,769      ASE_SPEC
+    45,541,581,152      STALL_BACKEND
+   177,787,642,222      cycles
+
+      74.132003522 seconds time elapsed
+
+      74.557006000 seconds user
+       0.027982000 seconds sys
+```
+
+Reexamining the code, something that stands out is the incrementation of the sumi values creates a dependency chain. These sum values are only used, however, to keep a running total that is added after the inner loop.
+
+$$
+\begin{aligned}
+\texttt{sumi1} &= \sum_{n=0}^3 \sum_m p_{nm} * \texttt{scales}_n \\
+               &= \sum_m \sum_{n=0}^3 p_{nm} * \texttt{scales}_n
+\end{aligned}
+$$
 
 
 
 
+```bash
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e LD_SPEC,ST_SPEC,DP_SPEC,VFP_SPEC,ASE_SPEC,STALL_BACKEND,cycles  taskset -c 2 ./external/llama.cpp/build_with_loads_but_less_neon/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+Events disabled
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+Events enabled
+| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          9.65 ± 0.01 |
+
+build: a3cb0474 (6735)
+
+ Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build_with_loads_but_less_neon/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
+
+    73,786,263,420      LD_SPEC
+     6,414,990,491      ST_SPEC
+   119,876,014,507      DP_SPEC
+    20,227,791,593      VFP_SPEC
+   184,916,327,057      ASE_SPEC
+    27,779,302,669      STALL_BACKEND
+   158,501,844,729      cycles
+
+      66.099109123 seconds time elapsed
+
+      66.529945000 seconds user
+       0.015987000 seconds sys
+
+
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
+```
 
 
 
