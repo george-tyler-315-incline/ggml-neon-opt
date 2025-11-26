@@ -2,6 +2,10 @@
 The goal of this repository is to optimize the ggml library for ARM Neon processors and achieve as high of a performance as I can on my Raspberry Pi 5. I hope to learn more about ML, and enjoy doing more with my Raspberry Pi.
 My Raspberry Pi 5 is a 4 core ARM Cortex-A76 with 16GB of RAM. Cores 2 and 3 are isolated. This documentation is not an exact representation of my workflow, was much written retrospectively in the interest of making this more readable.
 
+## Results so Far -> 10% Increase in Token Generation Rate
+I achieved a ~10% performance gain (8.8 → 9.65 t/s) by replacing a serial horizontal reduction with a vector multiply-accumulate (VMLA). This eliminated a register-domain crossing penalty and increased Instruction Level Parallelism (ILP) within the hotspot.
+![Diff](artifacts/q4_K_q8_K_diff1.png)
+
 ![Raspberry Pi With Freenove Case](artifacts/pi.jpg)
 
 ## Getting Started
@@ -23,8 +27,8 @@ mkdir -p models
 wget https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -O models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 ```
 
-## My Journey
-### Initial Investigations and Gaining Repo Familiarity
+## Initial Investigations and Gaining Repo Familiarity
+Probably skip this section....
 I can perform a basic build to familiarize myself with the repo.
 ```bash
 cmake -S external/llama.cpp -B external/llama.cpp/build \
@@ -178,7 +182,7 @@ cmake -S external/llama.cpp -B external/llama.cpp/build \
 cmake --build external/llama.cpp/build --verbose
 ```
 
-### Initial GGML Profiling on the Pi with Intel TMA Method
+## Initial GGML Profiling on the Pi with Intel TMA Method
 I will start with an initial benchmark T₀ of GGML with TinyLlama using 512 tokens for the prompt, 128 tokens for the generation, and one thread. I will it on an isolated core.
 ```bash
 # T₀
@@ -634,9 +638,9 @@ brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
 
 ![Flame Graph](artifacts/perf/flame.svg)
 
-So, clearly a lot of CPU time is being spent in `ggml_vec_dot_q4_K_q8_K`, with a bit over half of the time spent in the function itself and the rest of the time spent in the few functions it is calling.
+So, clearly a lot of CPU time is being spent in `ggml_vec_dot_q4_K_q8_K`, with a bit over half of the time spent in the function itself and the rest of the time spent in the few functions it is calling. We also can see the IPC is about 2.6, and since Cortex A76 is four-wide, we have some room for improvement.
 
-#### Pipeline Slots
+### Pipeline Slots
 From the perf stat measurements, we can see 0.17% of cycles where there are no fetched instructions available to dispatch are stalled. This area, then, is not our biggest problem. We also see our branch mispredict rate per instruction retired is 0.01%, our branch mispredict rate per branch is 0.3%, and instructions discarded per cycle, (inst_spec - inst_retired)/cycles, is 0.0086. Bad speculation, then, does not seem to be an issue. On the other hand, examining backend performance, we see that for 15% of cycles, fetched instructions are not able to dispatch due to resource constaints (https://developer.arm.com/documentation/100798/0401/Performance-Monitoring-Unit/PMU-events). I next want to look more closely at measurements that can indicate why we are backend-bound.
 
 But first, I want to know what the code is doing, and unfortunately there are a handful of preprocessor feature-based branches, so I gotta figure out exactly what is running and what isn't.
@@ -779,11 +783,10 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
 Comparing with the original source file confirms the `__ARM_FEATURE_MATMUL_INT8` and `__ARM_FEATURE_SVE` branches were omitted and that the only branch hit is the section under `__ARM_NEON`.
 
-#### Examining Backend
 
 Back to profiling, I will look more closely at why performance is so backend-bound. I will collect some measurements that suggest the performance is core-bound and then some that suggest the performance is memory-bound.
 
-##### Examining Core-Bound
+#### Examining Core-Based Performance
 Looking at speculative instructions for loads, stores, integer data-processing, advanced SIMD, and floating point processing, relative to total cycles provides evidence or for against execution unit saturation, one way a performance bottleneck is core-bound.
 
 ```bash
@@ -813,43 +816,14 @@ build: a3cb0474 (6735)
 
 ```
 
-I suppose evidence of execution-unit saturation might look like the instruction per cycle rate for a certain pipeline being larger than its max throughput. Maybe I am overthinking it, but I don't see it sufficient to simply divide these counts by cycles and compare to the number of pipelines that can serve that category, since not all the Cortex A76 pipelines are equivalent even for a given category. I think we can come up with a decent average-case estimate of pipeline utilization and if that does not appear to be cause for a bottleneck, then I am comfortable to say pipeline saturation is not a bottleneck.
-For a given pipeline P, which can accept a new instruction each cycle, there is saturation if the instructions per cycle through P exceeds one. The average per cycle rate of instructions which go through P includes the instructions that can be executed by P and only P, along with the equally shared rate of instructions which can go through P and n other pipelines.
-
-$$
-\text{Utilization}_P = \sum_{\substack{
-        i \in \\
-            \text{instructions}\\
-              \text{that can go}\\
-              \text{through } P
-    }} \frac{r_i}{n}, \quad m_i = \text{number of pipelines that can execute instruction } i, \quad r_i = \text{per-cycle rate of } i
-$$
-
 According to https://en.wikichip.org/wiki/arm_holdings/microarchitectures/cortex-a76#Execution_Units, there are two ASIMD/FP pipelines, three integer pipelines, and two load/store pipelines. The official Cortex A76 software optimization guide (https://developer.arm.com/documentation/pjdoc466751330-7215/latest/) gives more detail on each pipeline.
 
 ![Cortex A-76](artifacts/cortex-a76.svg).
 
+The total of ASE_SPEC, the advanced simd speculative instruction count, and VFP_SPEC, the floating point spectulative instruction count, is not much larger than the cycle count. The theoretical max of ASIMD/FP is 2 instructions per cycle, and we are doing roughly 1 ASIMD/FP instruction per cycle. Assuming memory is not a bottleneck, this might suggest dependency chains and poor instruction level parallelism. We can note in the inner loop of our hot function that the sumi1/2 variables do create dependency chains, and also force data to be passed between the ASIMD/FP pipeline and the integer pipeline.
 
-i will return to this
+#### Examining Memory-Based Performance
 
-##### Examining Memory-Bound
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-more measurements...
 
 ```bash
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_REFILL,L2D_CACHE,L2D_CACHE_REFILL,cycles,STALL_BACKEND taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
@@ -899,169 +873,9 @@ build: a3cb0474 (6735)
       74.607544000 seconds user
        0.023985000 seconds sys
 
-
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e MEM_ACCESS_RD,MEM_ACCESS_WR,LL_CACHE_MISS_RD,REMOTE_ACCESS,cycles  taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
-Events disabled
-| model                          |       size |     params | backend    | threads |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-Events enabled
-| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.70 ± 0.04 |
-
-build: a3cb0474 (6735)
-
- Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
-
-   111,179,627,116      MEM_ACCESS_RD
-     6,642,929,868      MEM_ACCESS_WR
-     6,340,630,955      LL_CACHE_MISS_RD
-                 0      REMOTE_ACCESS
-   175,841,658,671      cycles
-
-      73.314054184 seconds time elapsed
-
-      73.746620000 seconds user
-       0.023986000 seconds sys
-
-
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo shutdown now
-
-Broadcast message from root@raspberrypi on pts/0 (Mon 2025-11-10 21:56:08 PST):
-
-The system will power off now!
-
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ Connection to raspberrypi.local closed by remote host.
-Connection to raspberrypi.local closed.
-(base) λ ~/
-(base) λ ~/
-(base) λ ~/
-(base) λ ~/
-(base) λ ~/
-(base) λ ~/
-(base) λ ~/
-(base) λ ~/
-(base) λ ~/
-(base) λ ~/
-(base) λ ~/ ssh brandonneway@raspberrypi.local
-Linux raspberrypi 6.12.34+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.34-1+rpt1~bookworm (2025-06-26) aarch64
-
-The programs included with the Debian GNU/Linux system are free software;
-the exact distribution terms for each program are described in the
-individual files in /usr/share/doc/*/copyright.
-
-Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
-permitted by applicable law.
-Last login: Mon Nov 10 21:56:17 2025
-brandonneway@raspberrypi:~ $
-brandonneway@raspberrypi:~ $ cd dev/transformers/ggml-neon-opt/
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ ls
-artifacts  external  LICENSE  models  perf.data  preprocessed_arm_quants.c.txt  README.md
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_RD,L1D_CACHE_WR,L1D_CACHE_REFILL,L1D_CACHE_REFILL_RD,L1D_CACHE_REFILL_WR,L1D_CACHE_REFILL_INNER,L1D_CACHE_REFILL_OUTER askset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
-Events disabled
-Events enabled
-Workload failed: No such file or directory
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_RD,L1D_CACHE_WR,L1D_CACHE_REFILL,L1D_CACHE_REFILL_RD,L1D_CACHE_REFILL_WR,L1D_CACHE_REFILL_INNER,L1D_CACHE_REFILL_OUTER taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
-Events disabled
-| model                          |       size |     params | backend    | threads |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-Events enabled
-| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.83 ± 0.02 |
-
-build: a3cb0474 (6735)
-
- Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
-
-   118,357,216,203      L1D_CACHE                                                               (75.00%)
-   111,832,981,523      L1D_CACHE_RD                                                            (74.99%)
-     6,702,270,647      L1D_CACHE_WR                                                            (74.99%)
-       693,783,690      L1D_CACHE_REFILL                                                        (75.01%)
-       656,811,160      L1D_CACHE_REFILL_RD                                                     (75.01%)
-        37,131,581      L1D_CACHE_REFILL_WR                                                     (75.00%)
-       567,991,262      L1D_CACHE_REFILL_INNER                                                  (74.99%)
-       126,560,501      L1D_CACHE_REFILL_OUTER                                                  (74.99%)
-
-      72.949835165 seconds time elapsed
-
-      72.601574000 seconds user
-       0.083909000 seconds sys
-
-
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_RD,L1D_CACHE_WR,L1D_CACHE_REFILL,L1D_CACHE_REFILL_RD,L1D_CACHE_REFILL_WR taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
-Events disabled
-| model                          |       size |     params | backend    | threads |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-Events enabled
-
-
-
-
-
-
-| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.79 ± 0.01 |
-
-build: a3cb0474 (6735)
-
- Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
-
-   117,866,278,011      L1D_CACHE
-   111,219,203,977      L1D_CACHE_RD
-     6,647,072,100      L1D_CACHE_WR
-       701,933,983      L1D_CACHE_REFILL
-       670,649,227      L1D_CACHE_REFILL_RD
-        31,284,711      L1D_CACHE_REFILL_WR
-
-      72.611524639 seconds time elapsed
-
-      72.996497000 seconds user
-       0.027968000 seconds sys
-
-
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE,L1D_CACHE_RD,L1D_CACHE_WR,L1D_CACHE_REFILL,L1D_CACHE_WB taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
-Events disabled
-| model                          |       size |     params | backend    | threads |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-Events enabled
-| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.78 ± 0.03 |
-
-build: a3cb0474 (6735)
-
- Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
-
-   117,873,482,150      L1D_CACHE
-   111,226,120,507      L1D_CACHE_RD
-     6,647,359,075      L1D_CACHE_WR
-       720,178,397      L1D_CACHE_REFILL
-        57,481,472      L1D_CACHE_WB
-
-      72.703296001 seconds time elapsed
-
-      73.094244000 seconds user
-       0.019976000 seconds sys
-
-
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e L1D_CACHE_REFILL,L1D_CACHE_REFILL_INNER,L1D_CACHE_REFILL_OUTER,cycles taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
-Events disabled
-| model                          |       size |     params | backend    | threads |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-Events enabled
-| llama 1B Q4_K - Medium         | 636.18 MiB |     1.10 B | BLAS       |       1 |           tg128 |          8.77 ± 0.04 |
-
-build: a3cb0474 (6735)
-
- Performance counter stats for 'taskset -c 2 ./external/llama.cpp/build/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1':
-
-       718,165,956      L1D_CACHE_REFILL
-       569,261,662      L1D_CACHE_REFILL_INNER
-       148,904,245      L1D_CACHE_REFILL_OUTER
-   174,291,106,083      cycles
-
-      72.708145456 seconds time elapsed
-
-      73.107033000 seconds user
-       0.019977000 seconds sys
-
-
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
 ```
+
+### Code Modification Approach
 
 Taking a slightly different approach, I am going to modify the code to preserve the loads, but reduce the arithmetic NEON operations in the tight loop, to see if there is a speedup. If there is, it suggests the ASIMD pipelines were saturated.
 
@@ -1256,7 +1070,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 This time, the token generation remained at the baseline value T0. 
 
 ```bash
-udo perf stat --delay 500 -e LD_SPEC,ST_SPEC,DP_SPEC,VFP_SPEC,ASE_SPEC,STALL_BACKEND,cycles  taskset -c 2 ./external/llama.cpp/build_with_loads_but_less_neon/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
+sudo perf stat --delay 500 -e LD_SPEC,ST_SPEC,DP_SPEC,VFP_SPEC,ASE_SPEC,STALL_BACKEND,cycles  taskset -c 2 ./external/llama.cpp/build_with_loads_but_less_neon/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
 Events disabled
 | model                          |       size |     params | backend    | threads |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
@@ -1281,7 +1095,8 @@ build: a3cb0474 (6735)
        0.027982000 seconds sys
 ```
 
-Reexamining the code, something that stands out is the incrementation of the sumi values creates a dependency chain. These sum values are only used, however, to keep a running total that is added after the inner loop.
+This seems fairly suggestive that memory is not an issue. 
+
 
 $$
 \begin{aligned}
@@ -1290,8 +1105,357 @@ $$
 \end{aligned}
 $$
 
+#### LLVM-MCA
+Since I am still not really quite sure what the backend issue is, other than that the performance seems core-bound and might be poor instruction level parallelism, I am going to investigate using LLVM-MCA.
+
+```bash
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ /usr/bin/cc -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/.. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/../include -O2 -DNDEBUG -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -mcpu=cortex-a76+crypto+dotprod+noi8mm+nosve -fopenmp -std=gnu11 -o quants.s -S /home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ llvm-mca -mcpu=cortex-a76 -timeline -iterations=5 quants.s
+quants.s:3686:2: error: instruction requires: dotprod
+        sdot    v17.4s, v27.16b, v6.16b
+        ^
+quants.s:3789:2: error: instruction requires: dotprod
+        sdot    v0.4s, v7.16b, v20.16b
+        ^
+quants.s:3792:2: error: instruction requires: dotprod
+        sdot    v1.4s, v4.16b, v22.16b
+        ^
+quants.s:3795:2: error: instruction requires: dotprod
+        sdot    v0.4s, v3.16b, v21.16b
+        ^
+quants.s:3797:2: error: instruction requires: dotprod
+        sdot    v1.4s, v2.16b, v20.16b
+        ^
+quants.s:3925:2: error: instruction requires: dotprod
+        sdot    v1.4s, v0.16b, v4.16b
+        ^
+quants.s:3927:2: error: instruction requires: dotprod
+        sdot    v0.4s, v17.16b, v6.16b
+        ^
+quants.s:3928:2: error: instruction requires: dotprod
+        sdot    v1.4s, v16.16b, v5.16b
+        ^
+quants.s:3929:2: error: instruction requires: dotprod
+        sdot    v0.4s, v3.16b, v7.16b
+        ^
+
+[0] Code Region - giga_loop
+
+Iterations:        5
+Instructions:      125
+Total Cycles:      73
+Total uOps:        160
+
+Dispatch Width:    3
+uOps Per Cycle:    2.19
+IPC:               1.71
+Block RThroughput: 10.7
 
 
+Instruction Info:
+[1]: #uOps
+[2]: Latency
+[3]: RThroughput
+[4]: MayLoad
+[5]: MayStore
+[6]: HasSideEffects (U)
+
+[1]    [2]    [3]    [4]    [5]    [6]    Instructions:
+ 1      1     0.50                        mov	w8, #0
+ 1      1     0.50                        mov	x3, x13
+ 1      1     0.50                        mov	w4, #0
+ 1      1     0.50                        mov	x0, x6
+ 3      6     2.00    *                   ld1	{ v0.16b, v1.16b }, [x5], #32
+ 1      1     0.50                        add	x6, x6, #64
+ 1      1     0.50                        add	x3, x3, #2
+ 3      6     2.00    *                   ld1	{ v4.16b, v5.16b }, [x0], #32
+ 1      4     1.00    *                   ldurb	w9, [x3, #-1]
+ 1      3     0.50                        and	v19.16b, v7.16b, v0.16b
+ 1      3     0.50                        ushr	v18.16b, v0.16b, #4
+ 1      4     1.00    *                   ldurb	w10, [x3, #-2]
+ 1      3     0.50                        and	v17.16b, v7.16b, v1.16b
+ 1      3     0.50                        ushr	v16.16b, v1.16b, #4
+ 2      6     2.00    *                   ld1	{ v2.16b, v3.16b }, [x0]
+ 1      3     0.50                        mov	v1.16b, v6.16b
+ 1      3     0.50                        mov	v0.16b, v6.16b
+ 2      7     1.00                        addv	s1, v1.4s
+ 2      7     1.00                        addv	s0, v0.4s
+ 1      5     1.00                        fmov	w2, s1
+ 1      5     1.00                        fmov	w0, s0
+ 1      3     1.00                        madd	w4, w10, w2, w4
+ 1      3     1.00                        madd	w8, w9, w0, w8
+ 1      1     0.50                        cmp	x5, x7
+ 1      1     1.00                        b.ne	.L135
+
+
+Resources:
+[0]   - A57UnitB
+[1.0] - A57UnitI
+[1.1] - A57UnitI
+[2]   - A57UnitL
+[3]   - A57UnitM
+[4]   - A57UnitS
+[5]   - A57UnitW
+[6]   - A57UnitX
+
+
+Resource pressure per iteration:
+[0]    [1.0]  [1.1]  [2]    [3]    [4]    [5]    [6]
+1.00   4.40   4.60   10.00  2.00    -     5.00   5.00
+
+Resource pressure by instruction:
+[0]    [1.0]  [1.1]  [2]    [3]    [4]    [5]    [6]    Instructions:
+ -     0.40   0.60    -      -      -      -      -     mov	w8, #0
+ -     0.60   0.40    -      -      -      -      -     mov	x3, x13
+ -     0.40   0.60    -      -      -      -      -     mov	w4, #0
+ -     0.60   0.40    -      -      -      -      -     mov	x0, x6
+ -     0.40   0.60   2.00    -      -      -      -     ld1	{ v0.16b, v1.16b }, [x5], #32
+ -     0.60   0.40    -      -      -      -      -     add	x6, x6, #64
+ -     0.40   0.60    -      -      -      -      -     add	x3, x3, #2
+ -     0.60   0.40   2.00    -      -      -      -     ld1	{ v4.16b, v5.16b }, [x0], #32
+ -      -      -     1.00    -      -      -      -     ldurb	w9, [x3, #-1]
+ -      -      -      -      -      -      -     1.00   and	v19.16b, v7.16b, v0.16b
+ -      -      -      -      -      -     1.00    -     ushr	v18.16b, v0.16b, #4
+ -      -      -     1.00    -      -      -      -     ldurb	w10, [x3, #-2]
+ -      -      -      -      -      -      -     1.00   and	v17.16b, v7.16b, v1.16b
+ -      -      -      -      -      -     1.00    -     ushr	v16.16b, v1.16b, #4
+ -      -      -     2.00    -      -      -      -     ld1	{ v2.16b, v3.16b }, [x0]
+ -      -      -      -      -      -      -     1.00   mov	v1.16b, v6.16b
+ -      -      -      -      -      -     1.00    -     mov	v0.16b, v6.16b
+ -      -      -      -      -      -     1.00   1.00   addv	s1, v1.4s
+ -      -      -      -      -      -     1.00   1.00   addv	s0, v0.4s
+ -      -      -     1.00    -      -      -      -     fmov	w2, s1
+ -      -      -     1.00    -      -      -      -     fmov	w0, s0
+ -      -      -      -     1.00    -      -      -     madd	w4, w10, w2, w4
+ -      -      -      -     1.00    -      -      -     madd	w8, w9, w0, w8
+ -     0.40   0.60    -      -      -      -      -     cmp	x5, x7
+1.00    -      -      -      -      -      -      -     b.ne	.L135
+
+
+Timeline view:
+                    0123456789          0123456789          0123456789          012
+Index     0123456789          0123456789          0123456789          0123456789
+
+[0,0]     DeER .    .    .    .    .    .    .    .    .    .    .    .    .    . .   mov	w8, #0
+[0,1]     DeER .    .    .    .    .    .    .    .    .    .    .    .    .    . .   mov	x3, x13
+[0,2]     D=eER.    .    .    .    .    .    .    .    .    .    .    .    .    . .   mov	w4, #0
+[0,3]     .DeER.    .    .    .    .    .    .    .    .    .    .    .    .    . .   mov	x0, x6
+[0,4]     . DeeeeeeER    .    .    .    .    .    .    .    .    .    .    .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
+[0,5]     .  DeE----R    .    .    .    .    .    .    .    .    .    .    .    . .   add	x6, x6, #64
+[0,6]     .  DeE----R    .    .    .    .    .    .    .    .    .    .    .    . .   add	x3, x3, #2
+[0,7]     .   DeeeeeeER  .    .    .    .    .    .    .    .    .    .    .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
+[0,8]     .    D=eeeeER  .    .    .    .    .    .    .    .    .    .    .    . .   ldurb	w9, [x3, #-1]
+[0,9]     .    DeeeE--R  .    .    .    .    .    .    .    .    .    .    .    . .   and	v19.16b, v7.16b, v0.16b
+[0,10]    .    DeeeE--R  .    .    .    .    .    .    .    .    .    .    .    . .   ushr	v18.16b, v0.16b, #4
+[0,11]    .    .D=eeeeER .    .    .    .    .    .    .    .    .    .    .    . .   ldurb	w10, [x3, #-2]
+[0,12]    .    .DeeeE--R .    .    .    .    .    .    .    .    .    .    .    . .   and	v17.16b, v7.16b, v1.16b
+[0,13]    .    .DeeeE--R .    .    .    .    .    .    .    .    .    .    .    . .   ushr	v16.16b, v1.16b, #4
+[0,14]    .    . D===eeeeeeER .    .    .    .    .    .    .    .    .    .    . .   ld1	{ v2.16b, v3.16b }, [x0]
+[0,15]    .    . DeeeE------R .    .    .    .    .    .    .    .    .    .    . .   mov	v1.16b, v6.16b
+[0,16]    .    .  DeeeE-----R .    .    .    .    .    .    .    .    .    .    . .   mov	v0.16b, v6.16b
+[0,17]    .    .  D==eeeeeeeER.    .    .    .    .    .    .    .    .    .    . .   addv	s1, v1.4s
+[0,18]    .    .   D==eeeeeeeER    .    .    .    .    .    .    .    .    .    . .   addv	s0, v0.4s
+[0,19]    .    .   D========eeeeeER.    .    .    .    .    .    .    .    .    . .   fmov	w2, s1
+[0,20]    .    .    D========eeeeeER    .    .    .    .    .    .    .    .    . .   fmov	w0, s0
+[0,21]    .    .    D============eeeER  .    .    .    .    .    .    .    .    . .   madd	w4, w10, w2, w4
+[0,22]    .    .    D=============eeeER .    .    .    .    .    .    .    .    . .   madd	w8, w9, w0, w8
+[0,23]    .    .    .DeE--------------R .    .    .    .    .    .    .    .    . .   cmp	x5, x7
+[0,24]    .    .    .D=eE-------------R .    .    .    .    .    .    .    .    . .   b.ne	.L135
+[1,0]     .    .    .DeE--------------R .    .    .    .    .    .    .    .    . .   mov	w8, #0
+[1,1]     .    .    . DeE-------------R .    .    .    .    .    .    .    .    . .   mov	x3, x13
+[1,2]     .    .    . DeE-------------R .    .    .    .    .    .    .    .    . .   mov	w4, #0
+[1,3]     .    .    . D=eE------------R .    .    .    .    .    .    .    .    . .   mov	x0, x6
+[1,4]     .    .    .  DeeeeeeE-------R .    .    .    .    .    .    .    .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
+[1,5]     .    .    .   DeE-----------R .    .    .    .    .    .    .    .    . .   add	x6, x6, #64
+[1,6]     .    .    .   DeE-----------R .    .    .    .    .    .    .    .    . .   add	x3, x3, #2
+[1,7]     .    .    .    DeeeeeeE-----R .    .    .    .    .    .    .    .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
+[1,8]     .    .    .    .D===eeeeE---R .    .    .    .    .    .    .    .    . .   ldurb	w9, [x3, #-1]
+[1,9]     .    .    .    .DeeeE-------R .    .    .    .    .    .    .    .    . .   and	v19.16b, v7.16b, v0.16b
+[1,10]    .    .    .    .DeeeE-------R .    .    .    .    .    .    .    .    . .   ushr	v18.16b, v0.16b, #4
+[1,11]    .    .    .    . D===eeeeE--R .    .    .    .    .    .    .    .    . .   ldurb	w10, [x3, #-2]
+[1,12]    .    .    .    . DeeeE------R .    .    .    .    .    .    .    .    . .   and	v17.16b, v7.16b, v1.16b
+[1,13]    .    .    .    . DeeeE------R .    .    .    .    .    .    .    .    . .   ushr	v16.16b, v1.16b, #4
+[1,14]    .    .    .    .  D===eeeeeeER.    .    .    .    .    .    .    .    . .   ld1	{ v2.16b, v3.16b }, [x0]
+[1,15]    .    .    .    .  DeeeE------R.    .    .    .    .    .    .    .    . .   mov	v1.16b, v6.16b
+[1,16]    .    .    .    .   DeeeE-----R.    .    .    .    .    .    .    .    . .   mov	v0.16b, v6.16b
+[1,17]    .    .    .    .   D==eeeeeeeER    .    .    .    .    .    .    .    . .   addv	s1, v1.4s
+[1,18]    .    .    .    .    D==eeeeeeeER   .    .    .    .    .    .    .    . .   addv	s0, v0.4s
+[1,19]    .    .    .    .    D========eeeeeER    .    .    .    .    .    .    . .   fmov	w2, s1
+[1,20]    .    .    .    .    .D========eeeeeER   .    .    .    .    .    .    . .   fmov	w0, s0
+[1,21]    .    .    .    .    .D============eeeER .    .    .    .    .    .    . .   madd	w4, w10, w2, w4
+[1,22]    .    .    .    .    .D=============eeeER.    .    .    .    .    .    . .   madd	w8, w9, w0, w8
+[1,23]    .    .    .    .    . DeE--------------R.    .    .    .    .    .    . .   cmp	x5, x7
+[1,24]    .    .    .    .    . D=eE-------------R.    .    .    .    .    .    . .   b.ne	.L135
+[2,0]     .    .    .    .    . DeE--------------R.    .    .    .    .    .    . .   mov	w8, #0
+[2,1]     .    .    .    .    .  DeE-------------R.    .    .    .    .    .    . .   mov	x3, x13
+[2,2]     .    .    .    .    .  DeE-------------R.    .    .    .    .    .    . .   mov	w4, #0
+[2,3]     .    .    .    .    .  D=eE------------R.    .    .    .    .    .    . .   mov	x0, x6
+[2,4]     .    .    .    .    .   DeeeeeeE-------R.    .    .    .    .    .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
+[2,5]     .    .    .    .    .    DeE-----------R.    .    .    .    .    .    . .   add	x6, x6, #64
+[2,6]     .    .    .    .    .    DeE-----------R.    .    .    .    .    .    . .   add	x3, x3, #2
+[2,7]     .    .    .    .    .    .DeeeeeeE-----R.    .    .    .    .    .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
+[2,8]     .    .    .    .    .    . D===eeeeE---R.    .    .    .    .    .    . .   ldurb	w9, [x3, #-1]
+[2,9]     .    .    .    .    .    . DeeeE-------R.    .    .    .    .    .    . .   and	v19.16b, v7.16b, v0.16b
+[2,10]    .    .    .    .    .    . DeeeE-------R.    .    .    .    .    .    . .   ushr	v18.16b, v0.16b, #4
+[2,11]    .    .    .    .    .    .  D===eeeeE--R.    .    .    .    .    .    . .   ldurb	w10, [x3, #-2]
+[2,12]    .    .    .    .    .    .  DeeeE------R.    .    .    .    .    .    . .   and	v17.16b, v7.16b, v1.16b
+[2,13]    .    .    .    .    .    .  DeeeE------R.    .    .    .    .    .    . .   ushr	v16.16b, v1.16b, #4
+[2,14]    .    .    .    .    .    .   D===eeeeeeER    .    .    .    .    .    . .   ld1	{ v2.16b, v3.16b }, [x0]
+[2,15]    .    .    .    .    .    .   DeeeE------R    .    .    .    .    .    . .   mov	v1.16b, v6.16b
+[2,16]    .    .    .    .    .    .    DeeeE-----R    .    .    .    .    .    . .   mov	v0.16b, v6.16b
+[2,17]    .    .    .    .    .    .    D==eeeeeeeER   .    .    .    .    .    . .   addv	s1, v1.4s
+[2,18]    .    .    .    .    .    .    .D==eeeeeeeER  .    .    .    .    .    . .   addv	s0, v0.4s
+[2,19]    .    .    .    .    .    .    .D========eeeeeER   .    .    .    .    . .   fmov	w2, s1
+[2,20]    .    .    .    .    .    .    . D========eeeeeER  .    .    .    .    . .   fmov	w0, s0
+[2,21]    .    .    .    .    .    .    . D============eeeER.    .    .    .    . .   madd	w4, w10, w2, w4
+[2,22]    .    .    .    .    .    .    . D=============eeeER    .    .    .    . .   madd	w8, w9, w0, w8
+[2,23]    .    .    .    .    .    .    .  DeE--------------R    .    .    .    . .   cmp	x5, x7
+[2,24]    .    .    .    .    .    .    .  D=eE-------------R    .    .    .    . .   b.ne	.L135
+[3,0]     .    .    .    .    .    .    .  DeE--------------R    .    .    .    . .   mov	w8, #0
+[3,1]     .    .    .    .    .    .    .   DeE-------------R    .    .    .    . .   mov	x3, x13
+[3,2]     .    .    .    .    .    .    .   DeE-------------R    .    .    .    . .   mov	w4, #0
+[3,3]     .    .    .    .    .    .    .   D=eE------------R    .    .    .    . .   mov	x0, x6
+[3,4]     .    .    .    .    .    .    .    DeeeeeeE-------R    .    .    .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
+[3,5]     .    .    .    .    .    .    .    .DeE-----------R    .    .    .    . .   add	x6, x6, #64
+[3,6]     .    .    .    .    .    .    .    .DeE-----------R    .    .    .    . .   add	x3, x3, #2
+[3,7]     .    .    .    .    .    .    .    . DeeeeeeE-----R    .    .    .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
+[3,8]     .    .    .    .    .    .    .    .  D===eeeeE---R    .    .    .    . .   ldurb	w9, [x3, #-1]
+[3,9]     .    .    .    .    .    .    .    .  DeeeE-------R    .    .    .    . .   and	v19.16b, v7.16b, v0.16b
+[3,10]    .    .    .    .    .    .    .    .  DeeeE-------R    .    .    .    . .   ushr	v18.16b, v0.16b, #4
+[3,11]    .    .    .    .    .    .    .    .   D===eeeeE--R    .    .    .    . .   ldurb	w10, [x3, #-2]
+[3,12]    .    .    .    .    .    .    .    .   DeeeE------R    .    .    .    . .   and	v17.16b, v7.16b, v1.16b
+[3,13]    .    .    .    .    .    .    .    .   DeeeE------R    .    .    .    . .   ushr	v16.16b, v1.16b, #4
+[3,14]    .    .    .    .    .    .    .    .    D===eeeeeeER   .    .    .    . .   ld1	{ v2.16b, v3.16b }, [x0]
+[3,15]    .    .    .    .    .    .    .    .    DeeeE------R   .    .    .    . .   mov	v1.16b, v6.16b
+[3,16]    .    .    .    .    .    .    .    .    .DeeeE-----R   .    .    .    . .   mov	v0.16b, v6.16b
+[3,17]    .    .    .    .    .    .    .    .    .D==eeeeeeeER  .    .    .    . .   addv	s1, v1.4s
+[3,18]    .    .    .    .    .    .    .    .    . D==eeeeeeeER .    .    .    . .   addv	s0, v0.4s
+[3,19]    .    .    .    .    .    .    .    .    . D========eeeeeER  .    .    . .   fmov	w2, s1
+[3,20]    .    .    .    .    .    .    .    .    .  D========eeeeeER .    .    . .   fmov	w0, s0
+[3,21]    .    .    .    .    .    .    .    .    .  D============eeeER    .    . .   madd	w4, w10, w2, w4
+[3,22]    .    .    .    .    .    .    .    .    .  D=============eeeER   .    . .   madd	w8, w9, w0, w8
+[3,23]    .    .    .    .    .    .    .    .    .   DeE--------------R   .    . .   cmp	x5, x7
+[3,24]    .    .    .    .    .    .    .    .    .   D=eE-------------R   .    . .   b.ne	.L135
+[4,0]     .    .    .    .    .    .    .    .    .   DeE--------------R   .    . .   mov	w8, #0
+[4,1]     .    .    .    .    .    .    .    .    .    DeE-------------R   .    . .   mov	x3, x13
+[4,2]     .    .    .    .    .    .    .    .    .    DeE-------------R   .    . .   mov	w4, #0
+[4,3]     .    .    .    .    .    .    .    .    .    D=eE------------R   .    . .   mov	x0, x6
+[4,4]     .    .    .    .    .    .    .    .    .    .DeeeeeeE-------R   .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
+[4,5]     .    .    .    .    .    .    .    .    .    . DeE-----------R   .    . .   add	x6, x6, #64
+[4,6]     .    .    .    .    .    .    .    .    .    . DeE-----------R   .    . .   add	x3, x3, #2
+[4,7]     .    .    .    .    .    .    .    .    .    .  DeeeeeeE-----R   .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
+[4,8]     .    .    .    .    .    .    .    .    .    .   D===eeeeE---R   .    . .   ldurb	w9, [x3, #-1]
+[4,9]     .    .    .    .    .    .    .    .    .    .   DeeeE-------R   .    . .   and	v19.16b, v7.16b, v0.16b
+[4,10]    .    .    .    .    .    .    .    .    .    .   DeeeE-------R   .    . .   ushr	v18.16b, v0.16b, #4
+[4,11]    .    .    .    .    .    .    .    .    .    .    D===eeeeE--R   .    . .   ldurb	w10, [x3, #-2]
+[4,12]    .    .    .    .    .    .    .    .    .    .    DeeeE------R   .    . .   and	v17.16b, v7.16b, v1.16b
+[4,13]    .    .    .    .    .    .    .    .    .    .    DeeeE------R   .    . .   ushr	v16.16b, v1.16b, #4
+[4,14]    .    .    .    .    .    .    .    .    .    .    .D===eeeeeeER  .    . .   ld1	{ v2.16b, v3.16b }, [x0]
+[4,15]    .    .    .    .    .    .    .    .    .    .    .DeeeE------R  .    . .   mov	v1.16b, v6.16b
+[4,16]    .    .    .    .    .    .    .    .    .    .    . DeeeE-----R  .    . .   mov	v0.16b, v6.16b
+[4,17]    .    .    .    .    .    .    .    .    .    .    . D==eeeeeeeER .    . .   addv	s1, v1.4s
+[4,18]    .    .    .    .    .    .    .    .    .    .    .  D==eeeeeeeER.    . .   addv	s0, v0.4s
+[4,19]    .    .    .    .    .    .    .    .    .    .    .  D========eeeeeER . .   fmov	w2, s1
+[4,20]    .    .    .    .    .    .    .    .    .    .    .   D========eeeeeER. .   fmov	w0, s0
+[4,21]    .    .    .    .    .    .    .    .    .    .    .   D============eeeER.   madd	w4, w10, w2, w4
+[4,22]    .    .    .    .    .    .    .    .    .    .    .   D=============eeeER   madd	w8, w9, w0, w8
+[4,23]    .    .    .    .    .    .    .    .    .    .    .    DeE--------------R   cmp	x5, x7
+[4,24]    .    .    .    .    .    .    .    .    .    .    .    D=eE-------------R   b.ne	.L135
+
+
+Average Wait times (based on the timeline view):
+[0]: Executions
+[1]: Average time spent waiting in a scheduler's queue
+[2]: Average time spent waiting in a scheduler's queue while ready
+[3]: Average time elapsed from WB until retire stage
+
+      [0]    [1]    [2]    [3]
+0.     5     1.0    1.0    11.2      mov	w8, #0
+1.     5     1.0    0.2    10.4      mov	x3, x13
+2.     5     1.2    1.2    10.4      mov	w4, #0
+3.     5     1.8    1.0    9.6       mov	x0, x6
+4.     5     1.0    1.0    5.6       ld1	{ v0.16b, v1.16b }, [x5], #32
+5.     5     1.0    1.0    9.6       add	x6, x6, #64
+6.     5     1.0    1.0    9.6       add	x3, x3, #2
+7.     5     1.0    1.0    4.0       ld1	{ v4.16b, v5.16b }, [x0], #32
+8.     5     3.6    3.6    2.4       ldurb	w9, [x3, #-1]
+9.     5     1.0    1.0    6.0       and	v19.16b, v7.16b, v0.16b
+10.    5     1.0    1.0    6.0       ushr	v18.16b, v0.16b, #4
+11.    5     3.6    3.6    1.6       ldurb	w10, [x3, #-2]
+12.    5     1.0    1.0    5.2       and	v17.16b, v7.16b, v1.16b
+13.    5     1.0    1.0    5.2       ushr	v16.16b, v1.16b, #4
+14.    5     4.0    0.0    0.0       ld1	{ v2.16b, v3.16b }, [x0]
+15.    5     1.0    1.0    6.0       mov	v1.16b, v6.16b
+16.    5     1.0    1.0    5.0       mov	v0.16b, v6.16b
+17.    5     3.0    0.0    0.0       addv	s1, v1.4s
+18.    5     3.0    0.0    0.0       addv	s0, v0.4s
+19.    5     9.0    0.0    0.0       fmov	w2, s1
+20.    5     9.0    0.0    0.0       fmov	w0, s0
+21.    5     13.0   0.0    0.0       madd	w4, w10, w2, w4
+22.    5     14.0   0.0    0.0       madd	w8, w9, w0, w8
+23.    5     1.0    1.0    14.0      cmp	x5, x7
+24.    5     2.0    0.0    13.0      b.ne	.L135
+       5     3.2    0.9    5.4       <total>
+```
+
+### First optimization
+Before
+```c
+void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc)
+    ...
+        int32_t sumi1 = 0;
+        int32_t sumi2 = 0;
+
+        for (int j = 0; j < QK_K/64; ++j) {
+            const ggml_uint8x16x2_t q4bits = ggml_vld1q_u8_x2(q4); q4 += 32;
+
+            q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+            q4bytes.val[0] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[0], m4b));
+            q4bytes.val[1] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[1], m4b));
+
+            const int32x4_t p1 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+            sumi1 += vaddvq_s32(p1) * scales[2*j+0];
+
+            q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+            q4bytes.val[0] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[0], 4));
+            q4bytes.val[1] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[1], 4));
+
+            const int32x4_t p2 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+
+            sumi2 += vaddvq_s32(p2) * scales[2*j+1];
+        }
+
+        sumf += d * (sumi1 + sumi2);
+```
+
+After
+```c
+void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc)
+    ...
+    int32x4_t sumi1_vec = vdupq_n_s32(0);
+    int32x4_t sumi2_vec = vdupq_n_s32(0);
+
+    for (int j = 0; j < QK_K/64; ++j) {
+        const ggml_uint8x16x2_t q4bits = ggml_vld1q_u8_x2(q4); q4 += 32;
+
+        q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+        q4bytes.val[0] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[0], m4b));
+        q4bytes.val[1] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[1], m4b));
+
+        const int32x4_t p1 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+        sumi1_vec = vmlaq_n_s32(sumi1_vec, p1, scales[2*j+0]);
+
+        q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+        q4bytes.val[0] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[0], 4));
+        q4bytes.val[1] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[1], 4));
+
+        const int32x4_t p2 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+
+        sumi2_vec = vmlaq_n_s32(sumi2_vec, p2, scales[2*j+1]);
+    }
+
+    sumf += d * vaddvq_s32(vaddq_s32(sumi1_vec, sumi2_vec));
+```
 
 ```bash
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ sudo perf stat --delay 500 -e LD_SPEC,ST_SPEC,DP_SPEC,VFP_SPEC,ASE_SPEC,STALL_BACKEND,cycles  taskset -c 2 ./external/llama.cpp/build_with_loads_but_less_neon/bin/llama-bench -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 0 -n 128 -t 1
