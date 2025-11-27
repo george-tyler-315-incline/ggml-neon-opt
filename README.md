@@ -1,4 +1,4 @@
-# ggml-neon-opt - Work In Progress
+# ggml-neon-opt: Optimizing LLM Inference on Cortex A76 (Raspberry Pi 5) - Work In Progress
 The goal of this repository is to optimize the ggml library for ARM Neon processors and achieve as high of a performance as I can on my Raspberry Pi 5. I hope to learn more about ML, and enjoy doing more with my Raspberry Pi.
 My Raspberry Pi 5 is a 4 core ARM Cortex-A76 with 16GB of RAM. Cores 2 and 3 are isolated. This documentation is not an exact representation of my workflow, was much written retrospectively in the interest of making this more readable.
 
@@ -1110,46 +1110,41 @@ Since I am still not really quite sure what the backend issue is, other than tha
 
 ```bash
 brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ /usr/bin/cc -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/.. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/. -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu -I/home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/../include -O2 -DNDEBUG -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -mcpu=cortex-a76+crypto+dotprod+noi8mm+nosve -fopenmp -std=gnu11 -o quants.s -S /home/brandonneway/dev/transformers/ggml-neon-opt/external/llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c
-brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ llvm-mca -mcpu=cortex-a76 -timeline -iterations=5 quants.s
-quants.s:3686:2: error: instruction requires: dotprod
-        sdot    v17.4s, v27.16b, v6.16b
-        ^
-quants.s:3789:2: error: instruction requires: dotprod
-        sdot    v0.4s, v7.16b, v20.16b
-        ^
-quants.s:3792:2: error: instruction requires: dotprod
-        sdot    v1.4s, v4.16b, v22.16b
-        ^
-quants.s:3795:2: error: instruction requires: dotprod
-        sdot    v0.4s, v3.16b, v21.16b
-        ^
-quants.s:3797:2: error: instruction requires: dotprod
-        sdot    v1.4s, v2.16b, v20.16b
-        ^
-quants.s:3925:2: error: instruction requires: dotprod
-        sdot    v1.4s, v0.16b, v4.16b
-        ^
-quants.s:3927:2: error: instruction requires: dotprod
-        sdot    v0.4s, v17.16b, v6.16b
-        ^
-quants.s:3928:2: error: instruction requires: dotprod
-        sdot    v1.4s, v16.16b, v5.16b
-        ^
-quants.s:3929:2: error: instruction requires: dotprod
-        sdot    v0.4s, v3.16b, v7.16b
-        ^
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ llvm-mca-17 -mcpu=cortex-a76 -timeline -iterations=5 quants.s
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $ llvm-mca-17 -mcpu=cortex-a76  -timeline -iterations=5 -bottleneck-analysis quants.s
+quants.s:381:16: error: immediate must be an integer in range [0, 255].
+        movi    v17.16b, 0xfffffffffffffff8
+                         ^
+quants.s:859:15: error: immediate must be an integer in range [0, 255].
+        movi    v4.16b, 0xfffffffffffffff0
+                        ^
+quants.s:1801:16: error: immediate must be an integer in range [0, 255].
+        movi    v14.16b, 0xffffffffffffffe0
+                         ^
+quants.s:381:16: error: immediate must be an integer in range [0, 255].
+        movi    v17.16b, 0xfffffffffffffff8
+                         ^
+quants.s:859:15: error: immediate must be an integer in range [0, 255].
+        movi    v4.16b, 0xfffffffffffffff0
+                        ^
+quants.s:1801:16: error: immediate must be an integer in range [0, 255].
+        movi    v14.16b, 0xffffffffffffffe0
+                         ^
 
 [0] Code Region - giga_loop
 
 Iterations:        5
-Instructions:      125
-Total Cycles:      73
-Total uOps:        160
+Instructions:      145
+Total Cycles:      93
+Total uOps:        180
 
 Dispatch Width:    3
-uOps Per Cycle:    2.19
-IPC:               1.71
-Block RThroughput: 10.7
+uOps Per Cycle:    1.94
+IPC:               1.56
+Block RThroughput: 12.0
+
+
+No resource or data dependency bottlenecks discovered.
 
 
 Instruction Info:
@@ -1178,6 +1173,10 @@ Instruction Info:
  2      6     2.00    *                   ld1	{ v2.16b, v3.16b }, [x0]
  1      3     0.50                        mov	v1.16b, v6.16b
  1      3     0.50                        mov	v0.16b, v6.16b
+ 1      3     0.50                        sdot	v1.4s, v19.16b, v4.16b
+ 1      3     0.50                        sdot	v0.4s, v18.16b, v2.16b
+ 1      3     0.50                        sdot	v1.4s, v17.16b, v5.16b
+ 1      3     0.50                        sdot	v0.4s, v16.16b, v3.16b
  2      7     1.00                        addv	s1, v1.4s
  2      7     1.00                        addv	s0, v0.4s
  1      5     1.00                        fmov	w2, s1
@@ -1201,7 +1200,7 @@ Resources:
 
 Resource pressure per iteration:
 [0]    [1.0]  [1.1]  [2]    [3]    [4]    [5]    [6]
-1.00   4.40   4.60   10.00  2.00    -     5.00   5.00
+1.00   4.40   4.60   10.00  2.00    -     7.00   7.00
 
 Resource pressure by instruction:
 [0]    [1.0]  [1.1]  [2]    [3]    [4]    [5]    [6]    Instructions:
@@ -1214,14 +1213,18 @@ Resource pressure by instruction:
  -     0.40   0.60    -      -      -      -      -     add	x3, x3, #2
  -     0.60   0.40   2.00    -      -      -      -     ld1	{ v4.16b, v5.16b }, [x0], #32
  -      -      -     1.00    -      -      -      -     ldurb	w9, [x3, #-1]
- -      -      -      -      -      -      -     1.00   and	v19.16b, v7.16b, v0.16b
- -      -      -      -      -      -     1.00    -     ushr	v18.16b, v0.16b, #4
+ -      -      -      -      -      -     0.80   0.20   and	v19.16b, v7.16b, v0.16b
+ -      -      -      -      -      -     0.20   0.80   ushr	v18.16b, v0.16b, #4
  -      -      -     1.00    -      -      -      -     ldurb	w10, [x3, #-2]
- -      -      -      -      -      -      -     1.00   and	v17.16b, v7.16b, v1.16b
- -      -      -      -      -      -     1.00    -     ushr	v16.16b, v1.16b, #4
+ -      -      -      -      -      -     0.40   0.60   and	v17.16b, v7.16b, v1.16b
+ -      -      -      -      -      -     0.60   0.40   ushr	v16.16b, v1.16b, #4
  -      -      -     2.00    -      -      -      -     ld1	{ v2.16b, v3.16b }, [x0]
- -      -      -      -      -      -      -     1.00   mov	v1.16b, v6.16b
+ -      -      -      -      -      -     0.20   0.80   mov	v1.16b, v6.16b
  -      -      -      -      -      -     1.00    -     mov	v0.16b, v6.16b
+ -      -      -      -      -      -      -     1.00   sdot	v1.4s, v19.16b, v4.16b
+ -      -      -      -      -      -      -     1.00   sdot	v0.4s, v18.16b, v2.16b
+ -      -      -      -      -      -     1.00    -     sdot	v1.4s, v17.16b, v5.16b
+ -      -      -      -      -      -     0.80   0.20   sdot	v0.4s, v16.16b, v3.16b
  -      -      -      -      -      -     1.00   1.00   addv	s1, v1.4s
  -      -      -      -      -      -     1.00   1.00   addv	s0, v0.4s
  -      -      -     1.00    -      -      -      -     fmov	w2, s1
@@ -1233,134 +1236,148 @@ Resource pressure by instruction:
 
 
 Timeline view:
-                    0123456789          0123456789          0123456789          012
+                    0123456789          0123456789          0123456789          0123456789
 Index     0123456789          0123456789          0123456789          0123456789
 
-[0,0]     DeER .    .    .    .    .    .    .    .    .    .    .    .    .    . .   mov	w8, #0
-[0,1]     DeER .    .    .    .    .    .    .    .    .    .    .    .    .    . .   mov	x3, x13
-[0,2]     D=eER.    .    .    .    .    .    .    .    .    .    .    .    .    . .   mov	w4, #0
-[0,3]     .DeER.    .    .    .    .    .    .    .    .    .    .    .    .    . .   mov	x0, x6
-[0,4]     . DeeeeeeER    .    .    .    .    .    .    .    .    .    .    .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
-[0,5]     .  DeE----R    .    .    .    .    .    .    .    .    .    .    .    . .   add	x6, x6, #64
-[0,6]     .  DeE----R    .    .    .    .    .    .    .    .    .    .    .    . .   add	x3, x3, #2
-[0,7]     .   DeeeeeeER  .    .    .    .    .    .    .    .    .    .    .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
-[0,8]     .    D=eeeeER  .    .    .    .    .    .    .    .    .    .    .    . .   ldurb	w9, [x3, #-1]
-[0,9]     .    DeeeE--R  .    .    .    .    .    .    .    .    .    .    .    . .   and	v19.16b, v7.16b, v0.16b
-[0,10]    .    DeeeE--R  .    .    .    .    .    .    .    .    .    .    .    . .   ushr	v18.16b, v0.16b, #4
-[0,11]    .    .D=eeeeER .    .    .    .    .    .    .    .    .    .    .    . .   ldurb	w10, [x3, #-2]
-[0,12]    .    .DeeeE--R .    .    .    .    .    .    .    .    .    .    .    . .   and	v17.16b, v7.16b, v1.16b
-[0,13]    .    .DeeeE--R .    .    .    .    .    .    .    .    .    .    .    . .   ushr	v16.16b, v1.16b, #4
-[0,14]    .    . D===eeeeeeER .    .    .    .    .    .    .    .    .    .    . .   ld1	{ v2.16b, v3.16b }, [x0]
-[0,15]    .    . DeeeE------R .    .    .    .    .    .    .    .    .    .    . .   mov	v1.16b, v6.16b
-[0,16]    .    .  DeeeE-----R .    .    .    .    .    .    .    .    .    .    . .   mov	v0.16b, v6.16b
-[0,17]    .    .  D==eeeeeeeER.    .    .    .    .    .    .    .    .    .    . .   addv	s1, v1.4s
-[0,18]    .    .   D==eeeeeeeER    .    .    .    .    .    .    .    .    .    . .   addv	s0, v0.4s
-[0,19]    .    .   D========eeeeeER.    .    .    .    .    .    .    .    .    . .   fmov	w2, s1
-[0,20]    .    .    D========eeeeeER    .    .    .    .    .    .    .    .    . .   fmov	w0, s0
-[0,21]    .    .    D============eeeER  .    .    .    .    .    .    .    .    . .   madd	w4, w10, w2, w4
-[0,22]    .    .    D=============eeeER .    .    .    .    .    .    .    .    . .   madd	w8, w9, w0, w8
-[0,23]    .    .    .DeE--------------R .    .    .    .    .    .    .    .    . .   cmp	x5, x7
-[0,24]    .    .    .D=eE-------------R .    .    .    .    .    .    .    .    . .   b.ne	.L135
-[1,0]     .    .    .DeE--------------R .    .    .    .    .    .    .    .    . .   mov	w8, #0
-[1,1]     .    .    . DeE-------------R .    .    .    .    .    .    .    .    . .   mov	x3, x13
-[1,2]     .    .    . DeE-------------R .    .    .    .    .    .    .    .    . .   mov	w4, #0
-[1,3]     .    .    . D=eE------------R .    .    .    .    .    .    .    .    . .   mov	x0, x6
-[1,4]     .    .    .  DeeeeeeE-------R .    .    .    .    .    .    .    .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
-[1,5]     .    .    .   DeE-----------R .    .    .    .    .    .    .    .    . .   add	x6, x6, #64
-[1,6]     .    .    .   DeE-----------R .    .    .    .    .    .    .    .    . .   add	x3, x3, #2
-[1,7]     .    .    .    DeeeeeeE-----R .    .    .    .    .    .    .    .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
-[1,8]     .    .    .    .D===eeeeE---R .    .    .    .    .    .    .    .    . .   ldurb	w9, [x3, #-1]
-[1,9]     .    .    .    .DeeeE-------R .    .    .    .    .    .    .    .    . .   and	v19.16b, v7.16b, v0.16b
-[1,10]    .    .    .    .DeeeE-------R .    .    .    .    .    .    .    .    . .   ushr	v18.16b, v0.16b, #4
-[1,11]    .    .    .    . D===eeeeE--R .    .    .    .    .    .    .    .    . .   ldurb	w10, [x3, #-2]
-[1,12]    .    .    .    . DeeeE------R .    .    .    .    .    .    .    .    . .   and	v17.16b, v7.16b, v1.16b
-[1,13]    .    .    .    . DeeeE------R .    .    .    .    .    .    .    .    . .   ushr	v16.16b, v1.16b, #4
-[1,14]    .    .    .    .  D===eeeeeeER.    .    .    .    .    .    .    .    . .   ld1	{ v2.16b, v3.16b }, [x0]
-[1,15]    .    .    .    .  DeeeE------R.    .    .    .    .    .    .    .    . .   mov	v1.16b, v6.16b
-[1,16]    .    .    .    .   DeeeE-----R.    .    .    .    .    .    .    .    . .   mov	v0.16b, v6.16b
-[1,17]    .    .    .    .   D==eeeeeeeER    .    .    .    .    .    .    .    . .   addv	s1, v1.4s
-[1,18]    .    .    .    .    D==eeeeeeeER   .    .    .    .    .    .    .    . .   addv	s0, v0.4s
-[1,19]    .    .    .    .    D========eeeeeER    .    .    .    .    .    .    . .   fmov	w2, s1
-[1,20]    .    .    .    .    .D========eeeeeER   .    .    .    .    .    .    . .   fmov	w0, s0
-[1,21]    .    .    .    .    .D============eeeER .    .    .    .    .    .    . .   madd	w4, w10, w2, w4
-[1,22]    .    .    .    .    .D=============eeeER.    .    .    .    .    .    . .   madd	w8, w9, w0, w8
-[1,23]    .    .    .    .    . DeE--------------R.    .    .    .    .    .    . .   cmp	x5, x7
-[1,24]    .    .    .    .    . D=eE-------------R.    .    .    .    .    .    . .   b.ne	.L135
-[2,0]     .    .    .    .    . DeE--------------R.    .    .    .    .    .    . .   mov	w8, #0
-[2,1]     .    .    .    .    .  DeE-------------R.    .    .    .    .    .    . .   mov	x3, x13
-[2,2]     .    .    .    .    .  DeE-------------R.    .    .    .    .    .    . .   mov	w4, #0
-[2,3]     .    .    .    .    .  D=eE------------R.    .    .    .    .    .    . .   mov	x0, x6
-[2,4]     .    .    .    .    .   DeeeeeeE-------R.    .    .    .    .    .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
-[2,5]     .    .    .    .    .    DeE-----------R.    .    .    .    .    .    . .   add	x6, x6, #64
-[2,6]     .    .    .    .    .    DeE-----------R.    .    .    .    .    .    . .   add	x3, x3, #2
-[2,7]     .    .    .    .    .    .DeeeeeeE-----R.    .    .    .    .    .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
-[2,8]     .    .    .    .    .    . D===eeeeE---R.    .    .    .    .    .    . .   ldurb	w9, [x3, #-1]
-[2,9]     .    .    .    .    .    . DeeeE-------R.    .    .    .    .    .    . .   and	v19.16b, v7.16b, v0.16b
-[2,10]    .    .    .    .    .    . DeeeE-------R.    .    .    .    .    .    . .   ushr	v18.16b, v0.16b, #4
-[2,11]    .    .    .    .    .    .  D===eeeeE--R.    .    .    .    .    .    . .   ldurb	w10, [x3, #-2]
-[2,12]    .    .    .    .    .    .  DeeeE------R.    .    .    .    .    .    . .   and	v17.16b, v7.16b, v1.16b
-[2,13]    .    .    .    .    .    .  DeeeE------R.    .    .    .    .    .    . .   ushr	v16.16b, v1.16b, #4
-[2,14]    .    .    .    .    .    .   D===eeeeeeER    .    .    .    .    .    . .   ld1	{ v2.16b, v3.16b }, [x0]
-[2,15]    .    .    .    .    .    .   DeeeE------R    .    .    .    .    .    . .   mov	v1.16b, v6.16b
-[2,16]    .    .    .    .    .    .    DeeeE-----R    .    .    .    .    .    . .   mov	v0.16b, v6.16b
-[2,17]    .    .    .    .    .    .    D==eeeeeeeER   .    .    .    .    .    . .   addv	s1, v1.4s
-[2,18]    .    .    .    .    .    .    .D==eeeeeeeER  .    .    .    .    .    . .   addv	s0, v0.4s
-[2,19]    .    .    .    .    .    .    .D========eeeeeER   .    .    .    .    . .   fmov	w2, s1
-[2,20]    .    .    .    .    .    .    . D========eeeeeER  .    .    .    .    . .   fmov	w0, s0
-[2,21]    .    .    .    .    .    .    . D============eeeER.    .    .    .    . .   madd	w4, w10, w2, w4
-[2,22]    .    .    .    .    .    .    . D=============eeeER    .    .    .    . .   madd	w8, w9, w0, w8
-[2,23]    .    .    .    .    .    .    .  DeE--------------R    .    .    .    . .   cmp	x5, x7
-[2,24]    .    .    .    .    .    .    .  D=eE-------------R    .    .    .    . .   b.ne	.L135
-[3,0]     .    .    .    .    .    .    .  DeE--------------R    .    .    .    . .   mov	w8, #0
-[3,1]     .    .    .    .    .    .    .   DeE-------------R    .    .    .    . .   mov	x3, x13
-[3,2]     .    .    .    .    .    .    .   DeE-------------R    .    .    .    . .   mov	w4, #0
-[3,3]     .    .    .    .    .    .    .   D=eE------------R    .    .    .    . .   mov	x0, x6
-[3,4]     .    .    .    .    .    .    .    DeeeeeeE-------R    .    .    .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
-[3,5]     .    .    .    .    .    .    .    .DeE-----------R    .    .    .    . .   add	x6, x6, #64
-[3,6]     .    .    .    .    .    .    .    .DeE-----------R    .    .    .    . .   add	x3, x3, #2
-[3,7]     .    .    .    .    .    .    .    . DeeeeeeE-----R    .    .    .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
-[3,8]     .    .    .    .    .    .    .    .  D===eeeeE---R    .    .    .    . .   ldurb	w9, [x3, #-1]
-[3,9]     .    .    .    .    .    .    .    .  DeeeE-------R    .    .    .    . .   and	v19.16b, v7.16b, v0.16b
-[3,10]    .    .    .    .    .    .    .    .  DeeeE-------R    .    .    .    . .   ushr	v18.16b, v0.16b, #4
-[3,11]    .    .    .    .    .    .    .    .   D===eeeeE--R    .    .    .    . .   ldurb	w10, [x3, #-2]
-[3,12]    .    .    .    .    .    .    .    .   DeeeE------R    .    .    .    . .   and	v17.16b, v7.16b, v1.16b
-[3,13]    .    .    .    .    .    .    .    .   DeeeE------R    .    .    .    . .   ushr	v16.16b, v1.16b, #4
-[3,14]    .    .    .    .    .    .    .    .    D===eeeeeeER   .    .    .    . .   ld1	{ v2.16b, v3.16b }, [x0]
-[3,15]    .    .    .    .    .    .    .    .    DeeeE------R   .    .    .    . .   mov	v1.16b, v6.16b
-[3,16]    .    .    .    .    .    .    .    .    .DeeeE-----R   .    .    .    . .   mov	v0.16b, v6.16b
-[3,17]    .    .    .    .    .    .    .    .    .D==eeeeeeeER  .    .    .    . .   addv	s1, v1.4s
-[3,18]    .    .    .    .    .    .    .    .    . D==eeeeeeeER .    .    .    . .   addv	s0, v0.4s
-[3,19]    .    .    .    .    .    .    .    .    . D========eeeeeER  .    .    . .   fmov	w2, s1
-[3,20]    .    .    .    .    .    .    .    .    .  D========eeeeeER .    .    . .   fmov	w0, s0
-[3,21]    .    .    .    .    .    .    .    .    .  D============eeeER    .    . .   madd	w4, w10, w2, w4
-[3,22]    .    .    .    .    .    .    .    .    .  D=============eeeER   .    . .   madd	w8, w9, w0, w8
-[3,23]    .    .    .    .    .    .    .    .    .   DeE--------------R   .    . .   cmp	x5, x7
-[3,24]    .    .    .    .    .    .    .    .    .   D=eE-------------R   .    . .   b.ne	.L135
-[4,0]     .    .    .    .    .    .    .    .    .   DeE--------------R   .    . .   mov	w8, #0
-[4,1]     .    .    .    .    .    .    .    .    .    DeE-------------R   .    . .   mov	x3, x13
-[4,2]     .    .    .    .    .    .    .    .    .    DeE-------------R   .    . .   mov	w4, #0
-[4,3]     .    .    .    .    .    .    .    .    .    D=eE------------R   .    . .   mov	x0, x6
-[4,4]     .    .    .    .    .    .    .    .    .    .DeeeeeeE-------R   .    . .   ld1	{ v0.16b, v1.16b }, [x5], #32
-[4,5]     .    .    .    .    .    .    .    .    .    . DeE-----------R   .    . .   add	x6, x6, #64
-[4,6]     .    .    .    .    .    .    .    .    .    . DeE-----------R   .    . .   add	x3, x3, #2
-[4,7]     .    .    .    .    .    .    .    .    .    .  DeeeeeeE-----R   .    . .   ld1	{ v4.16b, v5.16b }, [x0], #32
-[4,8]     .    .    .    .    .    .    .    .    .    .   D===eeeeE---R   .    . .   ldurb	w9, [x3, #-1]
-[4,9]     .    .    .    .    .    .    .    .    .    .   DeeeE-------R   .    . .   and	v19.16b, v7.16b, v0.16b
-[4,10]    .    .    .    .    .    .    .    .    .    .   DeeeE-------R   .    . .   ushr	v18.16b, v0.16b, #4
-[4,11]    .    .    .    .    .    .    .    .    .    .    D===eeeeE--R   .    . .   ldurb	w10, [x3, #-2]
-[4,12]    .    .    .    .    .    .    .    .    .    .    DeeeE------R   .    . .   and	v17.16b, v7.16b, v1.16b
-[4,13]    .    .    .    .    .    .    .    .    .    .    DeeeE------R   .    . .   ushr	v16.16b, v1.16b, #4
-[4,14]    .    .    .    .    .    .    .    .    .    .    .D===eeeeeeER  .    . .   ld1	{ v2.16b, v3.16b }, [x0]
-[4,15]    .    .    .    .    .    .    .    .    .    .    .DeeeE------R  .    . .   mov	v1.16b, v6.16b
-[4,16]    .    .    .    .    .    .    .    .    .    .    . DeeeE-----R  .    . .   mov	v0.16b, v6.16b
-[4,17]    .    .    .    .    .    .    .    .    .    .    . D==eeeeeeeER .    . .   addv	s1, v1.4s
-[4,18]    .    .    .    .    .    .    .    .    .    .    .  D==eeeeeeeER.    . .   addv	s0, v0.4s
-[4,19]    .    .    .    .    .    .    .    .    .    .    .  D========eeeeeER . .   fmov	w2, s1
-[4,20]    .    .    .    .    .    .    .    .    .    .    .   D========eeeeeER. .   fmov	w0, s0
-[4,21]    .    .    .    .    .    .    .    .    .    .    .   D============eeeER.   madd	w4, w10, w2, w4
-[4,22]    .    .    .    .    .    .    .    .    .    .    .   D=============eeeER   madd	w8, w9, w0, w8
-[4,23]    .    .    .    .    .    .    .    .    .    .    .    DeE--------------R   cmp	x5, x7
-[4,24]    .    .    .    .    .    .    .    .    .    .    .    D=eE-------------R   b.ne	.L135
+[0,0]     DeER .    .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   mov	w8, #0
+[0,1]     DeER .    .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   mov	x3, x13
+[0,2]     D=eER.    .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   mov	w4, #0
+[0,3]     .DeER.    .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   mov	x0, x6
+[0,4]     . DeeeeeeER    .    .    .    .    .    .    .    .    .    .    .    .    .   .   ld1	{ v0.16b, v1.16b }, [x5], #32
+[0,5]     .  DeE----R    .    .    .    .    .    .    .    .    .    .    .    .    .   .   add	x6, x6, #64
+[0,6]     .  DeE----R    .    .    .    .    .    .    .    .    .    .    .    .    .   .   add	x3, x3, #2
+[0,7]     .   DeeeeeeER  .    .    .    .    .    .    .    .    .    .    .    .    .   .   ld1	{ v4.16b, v5.16b }, [x0], #32
+[0,8]     .    D=eeeeER  .    .    .    .    .    .    .    .    .    .    .    .    .   .   ldurb	w9, [x3, #-1]
+[0,9]     .    DeeeE--R  .    .    .    .    .    .    .    .    .    .    .    .    .   .   and	v19.16b, v7.16b, v0.16b
+[0,10]    .    DeeeE--R  .    .    .    .    .    .    .    .    .    .    .    .    .   .   ushr	v18.16b, v0.16b, #4
+[0,11]    .    .D=eeeeER .    .    .    .    .    .    .    .    .    .    .    .    .   .   ldurb	w10, [x3, #-2]
+[0,12]    .    .DeeeE--R .    .    .    .    .    .    .    .    .    .    .    .    .   .   and	v17.16b, v7.16b, v1.16b
+[0,13]    .    .DeeeE--R .    .    .    .    .    .    .    .    .    .    .    .    .   .   ushr	v16.16b, v1.16b, #4
+[0,14]    .    . D===eeeeeeER .    .    .    .    .    .    .    .    .    .    .    .   .   ld1	{ v2.16b, v3.16b }, [x0]
+[0,15]    .    . DeeeE------R .    .    .    .    .    .    .    .    .    .    .    .   .   mov	v1.16b, v6.16b
+[0,16]    .    .  DeeeE-----R .    .    .    .    .    .    .    .    .    .    .    .   .   mov	v0.16b, v6.16b
+[0,17]    .    .  D==eeeE---R .    .    .    .    .    .    .    .    .    .    .    .   .   sdot	v1.4s, v19.16b, v4.16b
+[0,18]    .    .  D========eeeER   .    .    .    .    .    .    .    .    .    .    .   .   sdot	v0.4s, v18.16b, v2.16b
+[0,19]    .    .   D====eeeE---R   .    .    .    .    .    .    .    .    .    .    .   .   sdot	v1.4s, v17.16b, v5.16b
+[0,20]    .    .   D==========eeeER.    .    .    .    .    .    .    .    .    .    .   .   sdot	v0.4s, v16.16b, v3.16b
+[0,21]    .    .    D=======eeeeeeeER   .    .    .    .    .    .    .    .    .    .   .   addv	s1, v1.4s
+[0,22]    .    .    .D===========eeeeeeeER   .    .    .    .    .    .    .    .    .   .   addv	s0, v0.4s
+[0,23]    .    .    .D==============eeeeeER  .    .    .    .    .    .    .    .    .   .   fmov	w2, s1
+[0,24]    .    .    . D==================eeeeeER  .    .    .    .    .    .    .    .   .   fmov	w0, s0
+[0,25]    .    .    . D==================eeeE--R  .    .    .    .    .    .    .    .   .   madd	w4, w10, w2, w4
+[0,26]    .    .    . D=======================eeeER    .    .    .    .    .    .    .   .   madd	w8, w9, w0, w8
+[0,27]    .    .    .  DeE------------------------R    .    .    .    .    .    .    .   .   cmp	x5, x7
+[0,28]    .    .    .  D=eE-----------------------R    .    .    .    .    .    .    .   .   b.ne	.L135
+[1,0]     .    .    .  DeE------------------------R    .    .    .    .    .    .    .   .   mov	w8, #0
+[1,1]     .    .    .   DeE-----------------------R    .    .    .    .    .    .    .   .   mov	x3, x13
+[1,2]     .    .    .   DeE-----------------------R    .    .    .    .    .    .    .   .   mov	w4, #0
+[1,3]     .    .    .   D=eE----------------------R    .    .    .    .    .    .    .   .   mov	x0, x6
+[1,4]     .    .    .    DeeeeeeE-----------------R    .    .    .    .    .    .    .   .   ld1	{ v0.16b, v1.16b }, [x5], #32
+[1,5]     .    .    .    .DeE---------------------R    .    .    .    .    .    .    .   .   add	x6, x6, #64
+[1,6]     .    .    .    .DeE---------------------R    .    .    .    .    .    .    .   .   add	x3, x3, #2
+[1,7]     .    .    .    . DeeeeeeE---------------R    .    .    .    .    .    .    .   .   ld1	{ v4.16b, v5.16b }, [x0], #32
+[1,8]     .    .    .    .  D=eeeeE---------------R    .    .    .    .    .    .    .   .   ldurb	w9, [x3, #-1]
+[1,9]     .    .    .    .  DeeeE-----------------R    .    .    .    .    .    .    .   .   and	v19.16b, v7.16b, v0.16b
+[1,10]    .    .    .    .  DeeeE-----------------R    .    .    .    .    .    .    .   .   ushr	v18.16b, v0.16b, #4
+[1,11]    .    .    .    .   D=eeeeE--------------R    .    .    .    .    .    .    .   .   ldurb	w10, [x3, #-2]
+[1,12]    .    .    .    .   DeeeE----------------R    .    .    .    .    .    .    .   .   and	v17.16b, v7.16b, v1.16b
+[1,13]    .    .    .    .   D=eeeE---------------R    .    .    .    .    .    .    .   .   ushr	v16.16b, v1.16b, #4
+[1,14]    .    .    .    .    D===eeeeeeE---------R    .    .    .    .    .    .    .   .   ld1	{ v2.16b, v3.16b }, [x0]
+[1,15]    .    .    .    .    DeeeE---------------R    .    .    .    .    .    .    .   .   mov	v1.16b, v6.16b
+[1,16]    .    .    .    .    .DeeeE--------------R    .    .    .    .    .    .    .   .   mov	v0.16b, v6.16b
+[1,17]    .    .    .    .    .D==eeeE------------R    .    .    .    .    .    .    .   .   sdot	v1.4s, v19.16b, v4.16b
+[1,18]    .    .    .    .    .D========eeeE------R    .    .    .    .    .    .    .   .   sdot	v0.4s, v18.16b, v2.16b
+[1,19]    .    .    .    .    . D====eeeE---------R    .    .    .    .    .    .    .   .   sdot	v1.4s, v17.16b, v5.16b
+[1,20]    .    .    .    .    . D==========eeeE---R    .    .    .    .    .    .    .   .   sdot	v0.4s, v16.16b, v3.16b
+[1,21]    .    .    .    .    .  D=======eeeeeeeE-R    .    .    .    .    .    .    .   .   addv	s1, v1.4s
+[1,22]    .    .    .    .    .   D===========eeeeeeeER.    .    .    .    .    .    .   .   addv	s0, v0.4s
+[1,23]    .    .    .    .    .   D=============eeeeeER.    .    .    .    .    .    .   .   fmov	w2, s1
+[1,24]    .    .    .    .    .    D==================eeeeeER    .    .    .    .    .   .   fmov	w0, s0
+[1,25]    .    .    .    .    .    D=================eeeE---R    .    .    .    .    .   .   madd	w4, w10, w2, w4
+[1,26]    .    .    .    .    .    D=======================eeeER .    .    .    .    .   .   madd	w8, w9, w0, w8
+[1,27]    .    .    .    .    .    .DeE------------------------R .    .    .    .    .   .   cmp	x5, x7
+[1,28]    .    .    .    .    .    .D=eE-----------------------R .    .    .    .    .   .   b.ne	.L135
+[2,0]     .    .    .    .    .    .DeE------------------------R .    .    .    .    .   .   mov	w8, #0
+[2,1]     .    .    .    .    .    . DeE-----------------------R .    .    .    .    .   .   mov	x3, x13
+[2,2]     .    .    .    .    .    . DeE-----------------------R .    .    .    .    .   .   mov	w4, #0
+[2,3]     .    .    .    .    .    . D=eE----------------------R .    .    .    .    .   .   mov	x0, x6
+[2,4]     .    .    .    .    .    .  DeeeeeeE-----------------R .    .    .    .    .   .   ld1	{ v0.16b, v1.16b }, [x5], #32
+[2,5]     .    .    .    .    .    .   DeE---------------------R .    .    .    .    .   .   add	x6, x6, #64
+[2,6]     .    .    .    .    .    .   DeE---------------------R .    .    .    .    .   .   add	x3, x3, #2
+[2,7]     .    .    .    .    .    .    D=eeeeeeE--------------R .    .    .    .    .   .   ld1	{ v4.16b, v5.16b }, [x0], #32
+[2,8]     .    .    .    .    .    .    .D==eeeeE--------------R .    .    .    .    .   .   ldurb	w9, [x3, #-1]
+[2,9]     .    .    .    .    .    .    .DeeeE-----------------R .    .    .    .    .   .   and	v19.16b, v7.16b, v0.16b
+[2,10]    .    .    .    .    .    .    .DeeeE-----------------R .    .    .    .    .   .   ushr	v18.16b, v0.16b, #4
+[2,11]    .    .    .    .    .    .    . D==eeeeE-------------R .    .    .    .    .   .   ldurb	w10, [x3, #-2]
+[2,12]    .    .    .    .    .    .    . DeeeE----------------R .    .    .    .    .   .   and	v17.16b, v7.16b, v1.16b
+[2,13]    .    .    .    .    .    .    . D=eeeE---------------R .    .    .    .    .   .   ushr	v16.16b, v1.16b, #4
+[2,14]    .    .    .    .    .    .    .  D=====eeeeeeE-------R .    .    .    .    .   .   ld1	{ v2.16b, v3.16b }, [x0]
+[2,15]    .    .    .    .    .    .    .  DeeeE---------------R .    .    .    .    .   .   mov	v1.16b, v6.16b
+[2,16]    .    .    .    .    .    .    .   DeeeE--------------R .    .    .    .    .   .   mov	v0.16b, v6.16b
+[2,17]    .    .    .    .    .    .    .   D==eeeE------------R .    .    .    .    .   .   sdot	v1.4s, v19.16b, v4.16b
+[2,18]    .    .    .    .    .    .    .   D==========eeeE----R .    .    .    .    .   .   sdot	v0.4s, v18.16b, v2.16b
+[2,19]    .    .    .    .    .    .    .    D====eeeE---------R .    .    .    .    .   .   sdot	v1.4s, v17.16b, v5.16b
+[2,20]    .    .    .    .    .    .    .    D============eeeE-R .    .    .    .    .   .   sdot	v0.4s, v16.16b, v3.16b
+[2,21]    .    .    .    .    .    .    .    .D======eeeeeeeE--R .    .    .    .    .   .   addv	s1, v1.4s
+[2,22]    .    .    .    .    .    .    .    . D=============eeeeeeeER.    .    .    .   .   addv	s0, v0.4s
+[2,23]    .    .    .    .    .    .    .    . D============eeeeeE---R.    .    .    .   .   fmov	w2, s1
+[2,24]    .    .    .    .    .    .    .    .  D====================eeeeeER    .    .   .   fmov	w0, s0
+[2,25]    .    .    .    .    .    .    .    .  D================eeeE------R    .    .   .   madd	w4, w10, w2, w4
+[2,26]    .    .    .    .    .    .    .    .  D=========================eeeER .    .   .   madd	w8, w9, w0, w8
+[2,27]    .    .    .    .    .    .    .    .   DeE--------------------------R .    .   .   cmp	x5, x7
+[2,28]    .    .    .    .    .    .    .    .   D=eE-------------------------R .    .   .   b.ne	.L135
+[3,0]     .    .    .    .    .    .    .    .   DeE--------------------------R .    .   .   mov	w8, #0
+[3,1]     .    .    .    .    .    .    .    .    DeE-------------------------R .    .   .   mov	x3, x13
+[3,2]     .    .    .    .    .    .    .    .    DeE-------------------------R .    .   .   mov	w4, #0
+[3,3]     .    .    .    .    .    .    .    .    D=eE------------------------R .    .   .   mov	x0, x6
+[3,4]     .    .    .    .    .    .    .    .    .DeeeeeeE-------------------R .    .   .   ld1	{ v0.16b, v1.16b }, [x5], #32
+[3,5]     .    .    .    .    .    .    .    .    . DeE-----------------------R .    .   .   add	x6, x6, #64
+[3,6]     .    .    .    .    .    .    .    .    . DeE-----------------------R .    .   .   add	x3, x3, #2
+[3,7]     .    .    .    .    .    .    .    .    .  D=eeeeeeE----------------R .    .   .   ld1	{ v4.16b, v5.16b }, [x0], #32
+[3,8]     .    .    .    .    .    .    .    .    .   D==eeeeE----------------R .    .   .   ldurb	w9, [x3, #-1]
+[3,9]     .    .    .    .    .    .    .    .    .   DeeeE-------------------R .    .   .   and	v19.16b, v7.16b, v0.16b
+[3,10]    .    .    .    .    .    .    .    .    .   D=eeeE------------------R .    .   .   ushr	v18.16b, v0.16b, #4
+[3,11]    .    .    .    .    .    .    .    .    .    D==eeeeE---------------R .    .   .   ldurb	w10, [x3, #-2]
+[3,12]    .    .    .    .    .    .    .    .    .    DeeeE------------------R .    .   .   and	v17.16b, v7.16b, v1.16b
+[3,13]    .    .    .    .    .    .    .    .    .    D=eeeE-----------------R .    .   .   ushr	v16.16b, v1.16b, #4
+[3,14]    .    .    .    .    .    .    .    .    .    .D====eeeeeeE----------R .    .   .   ld1	{ v2.16b, v3.16b }, [x0]
+[3,15]    .    .    .    .    .    .    .    .    .    .DeeeE-----------------R .    .   .   mov	v1.16b, v6.16b
+[3,16]    .    .    .    .    .    .    .    .    .    . DeeeE----------------R .    .   .   mov	v0.16b, v6.16b
+[3,17]    .    .    .    .    .    .    .    .    .    . D==eeeE--------------R .    .   .   sdot	v1.4s, v19.16b, v4.16b
+[3,18]    .    .    .    .    .    .    .    .    .    . D=========eeeE-------R .    .   .   sdot	v0.4s, v18.16b, v2.16b
+[3,19]    .    .    .    .    .    .    .    .    .    .  D====eeeE-----------R .    .   .   sdot	v1.4s, v17.16b, v5.16b
+[3,20]    .    .    .    .    .    .    .    .    .    .  D===========eeeE----R .    .   .   sdot	v0.4s, v16.16b, v3.16b
+[3,21]    .    .    .    .    .    .    .    .    .    .   D======eeeeeeeE----R .    .   .   addv	s1, v1.4s
+[3,22]    .    .    .    .    .    .    .    .    .    .    D============eeeeeeeER   .   .   addv	s0, v0.4s
+[3,23]    .    .    .    .    .    .    .    .    .    .    D============eeeeeE--R   .   .   fmov	w2, s1
+[3,24]    .    .    .    .    .    .    .    .    .    .    .D==================eeeeeER  .   fmov	w0, s0
+[3,25]    .    .    .    .    .    .    .    .    .    .    .D================eeeE----R  .   madd	w4, w10, w2, w4
+[3,26]    .    .    .    .    .    .    .    .    .    .    .D=======================eeeER   madd	w8, w9, w0, w8
+[3,27]    .    .    .    .    .    .    .    .    .    .    . DeE------------------------R   cmp	x5, x7
+[3,28]    .    .    .    .    .    .    .    .    .    .    . D=eE-----------------------R   b.ne	.L135
+[4,0]     .    .    .    .    .    .    .    .    .    .    . DeE------------------------R   mov	w8, #0
+[4,1]     .    .    .    .    .    .    .    .    .    .    .  DeE-----------------------R   mov	x3, x13
+[4,2]     .    .    .    .    .    .    .    .    .    .    .  DeE-----------------------R   mov	w4, #0
+[4,3]     .    .    .    .    .    .    .    .    .    .    .  D=eE----------------------R   mov	x0, x6
+[4,4]     .    .    .    .    .    .    .    .    .    .    .   DeeeeeeE-----------------R   ld1	{ v0.16b, v1.16b }, [x5], #32
+[4,5]     .    .    .    .    .    .    .    .    .    .    .    DeE---------------------R   add	x6, x6, #64
+[4,6]     .    .    .    .    .    .    .    .    .    .    .    DeE---------------------R   add	x3, x3, #2
+[4,7]     .    .    .    .    .    .    .    .    .    .    .    .DeeeeeeE---------------R   ld1	{ v4.16b, v5.16b }, [x0], #32
+[4,8]     .    .    .    .    .    .    .    .    .    .    .    . D==eeeeE--------------R   ldurb	w9, [x3, #-1]
+[4,9]     .    .    .    .    .    .    .    .    .    .    .    . DeeeE-----------------R   and	v19.16b, v7.16b, v0.16b
+[4,10]    .    .    .    .    .    .    .    .    .    .    .    . DeeeE-----------------R   ushr	v18.16b, v0.16b, #4
+[4,11]    .    .    .    .    .    .    .    .    .    .    .    .  D==eeeeE-------------R   ldurb	w10, [x3, #-2]
+[4,12]    .    .    .    .    .    .    .    .    .    .    .    .  DeeeE----------------R   and	v17.16b, v7.16b, v1.16b
+[4,13]    .    .    .    .    .    .    .    .    .    .    .    .  DeeeE----------------R   ushr	v16.16b, v1.16b, #4
+[4,14]    .    .    .    .    .    .    .    .    .    .    .    .   D====eeeeeeE--------R   ld1	{ v2.16b, v3.16b }, [x0]
+[4,15]    .    .    .    .    .    .    .    .    .    .    .    .   DeeeE---------------R   mov	v1.16b, v6.16b
+[4,16]    .    .    .    .    .    .    .    .    .    .    .    .    DeeeE--------------R   mov	v0.16b, v6.16b
+[4,17]    .    .    .    .    .    .    .    .    .    .    .    .    D===eeeE-----------R   sdot	v1.4s, v19.16b, v4.16b
+[4,18]    .    .    .    .    .    .    .    .    .    .    .    .    D=========eeeE-----R   sdot	v0.4s, v18.16b, v2.16b
+[4,19]    .    .    .    .    .    .    .    .    .    .    .    .    .D=====eeeE--------R   sdot	v1.4s, v17.16b, v5.16b
+[4,20]    .    .    .    .    .    .    .    .    .    .    .    .    .D===========eeeE--R   sdot	v0.4s, v16.16b, v3.16b
+[4,21]    .    .    .    .    .    .    .    .    .    .    .    .    . D========eeeeeeeER   addv	s1, v1.4s
+Truncated display due to cycle limit
 
 
 Average Wait times (based on the timeline view):
@@ -1370,32 +1387,37 @@ Average Wait times (based on the timeline view):
 [3]: Average time elapsed from WB until retire stage
 
       [0]    [1]    [2]    [3]
-0.     5     1.0    1.0    11.2      mov	w8, #0
-1.     5     1.0    0.2    10.4      mov	x3, x13
-2.     5     1.2    1.2    10.4      mov	w4, #0
-3.     5     1.8    1.0    9.6       mov	x0, x6
-4.     5     1.0    1.0    5.6       ld1	{ v0.16b, v1.16b }, [x5], #32
-5.     5     1.0    1.0    9.6       add	x6, x6, #64
-6.     5     1.0    1.0    9.6       add	x3, x3, #2
-7.     5     1.0    1.0    4.0       ld1	{ v4.16b, v5.16b }, [x0], #32
-8.     5     3.6    3.6    2.4       ldurb	w9, [x3, #-1]
-9.     5     1.0    1.0    6.0       and	v19.16b, v7.16b, v0.16b
-10.    5     1.0    1.0    6.0       ushr	v18.16b, v0.16b, #4
-11.    5     3.6    3.6    1.6       ldurb	w10, [x3, #-2]
-12.    5     1.0    1.0    5.2       and	v17.16b, v7.16b, v1.16b
-13.    5     1.0    1.0    5.2       ushr	v16.16b, v1.16b, #4
-14.    5     4.0    0.0    0.0       ld1	{ v2.16b, v3.16b }, [x0]
-15.    5     1.0    1.0    6.0       mov	v1.16b, v6.16b
-16.    5     1.0    1.0    5.0       mov	v0.16b, v6.16b
-17.    5     3.0    0.0    0.0       addv	s1, v1.4s
-18.    5     3.0    0.0    0.0       addv	s0, v0.4s
-19.    5     9.0    0.0    0.0       fmov	w2, s1
-20.    5     9.0    0.0    0.0       fmov	w0, s0
-21.    5     13.0   0.0    0.0       madd	w4, w10, w2, w4
-22.    5     14.0   0.0    0.0       madd	w8, w9, w0, w8
-23.    5     1.0    1.0    14.0      cmp	x5, x7
-24.    5     2.0    0.0    13.0      b.ne	.L135
-       5     3.2    0.9    5.4       <total>
+0.     5     1.0    1.0    19.6      mov	w8, #0
+1.     5     1.0    0.2    18.8      mov	x3, x13
+2.     5     1.2    1.2    18.8      mov	w4, #0
+3.     5     1.8    1.0    18.0      mov	x0, x6
+4.     5     1.0    1.0    14.0      ld1	{ v0.16b, v1.16b }, [x5], #32
+5.     5     1.0    1.0    18.0      add	x6, x6, #64
+6.     5     1.0    1.0    18.0      add	x3, x3, #2
+7.     5     1.4    1.4    12.0      ld1	{ v4.16b, v5.16b }, [x0], #32
+8.     5     2.6    2.6    11.8      ldurb	w9, [x3, #-1]
+9.     5     1.0    1.0    14.4      and	v19.16b, v7.16b, v0.16b
+10.    5     1.2    1.2    14.2      ushr	v18.16b, v0.16b, #4
+11.    5     2.6    2.6    11.0      ldurb	w10, [x3, #-2]
+12.    5     1.0    1.0    13.6      and	v17.16b, v7.16b, v1.16b
+13.    5     1.6    1.6    13.0      ushr	v16.16b, v1.16b, #4
+14.    5     4.8    0.4    6.8       ld1	{ v2.16b, v3.16b }, [x0]
+15.    5     1.0    1.0    13.6      mov	v1.16b, v6.16b
+16.    5     1.0    1.0    12.6      mov	v0.16b, v6.16b
+17.    5     3.2    0.2    10.4      sdot	v1.4s, v19.16b, v4.16b
+18.    5     9.8    0.0    4.4       sdot	v0.4s, v18.16b, v2.16b
+19.    5     5.2    0.0    8.0       sdot	v1.4s, v17.16b, v5.16b
+20.    5     11.8   0.0    2.0       sdot	v0.4s, v16.16b, v3.16b
+21.    5     7.8    0.6    1.4       addv	s1, v1.4s
+22.    5     12.8   0.0    0.0       addv	s0, v0.4s
+23.    5     14.0   0.2    1.0       fmov	w2, s1
+24.    5     19.4   0.6    0.0       fmov	w0, s0
+25.    5     18.0   0.0    3.4       madd	w4, w10, w2, w4
+26.    5     24.4   0.0    0.0       madd	w8, w9, w0, w8
+27.    5     1.0    1.0    24.4      cmp	x5, x7
+28.    5     2.0    0.0    23.4      b.ne	.L135
+       5     5.4    0.8    11.3      <total>
+brandonneway@raspberrypi:~/dev/transformers/ggml-neon-opt $
 ```
 
 ### First optimization
